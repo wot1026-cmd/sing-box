@@ -27,3 +27,4 @@ domain_suffix_set:
   - sentry.io
   - datadoghq.com
   - siftscience.com
+  - safebrowsing.apple
