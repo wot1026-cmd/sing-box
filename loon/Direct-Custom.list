@@ -7,7 +7,5 @@ DOMAIN-SUFFIX,mask.icloud.com
 DOMAIN-SUFFIX,mask-h2.icloud.com
 DOMAIN-SUFFIX,mask-api.icloud.com
 DOMAIN-SUFFIX,apple-relay.cloudflare.com
-DOMAIN-SUFFIX,360.cn
-DOMAIN-SUFFIX,qihucdn.com
-DOMAIN-SUFFIX,360.com
+DOMAIN-SUFFIX,mvconf.f.360.cn
 DOMAIN-KEYWORD,apple-relay
