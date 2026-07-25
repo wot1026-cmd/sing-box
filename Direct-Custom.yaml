@@ -8,5 +8,6 @@ domain_suffix_set:
   - mask-api.icloud.com
   - apple-relay.cloudflare.com
   - mvconf.f.360.cn
+  - ampaeservices.com
 domain_keyword_set:
   - apple-relay
