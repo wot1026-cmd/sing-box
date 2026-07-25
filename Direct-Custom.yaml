@@ -7,8 +7,6 @@ domain_suffix_set:
   - mask-h2.icloud.com
   - mask-api.icloud.com
   - apple-relay.cloudflare.com
-  - 360.cn
-  - qihucdn.com
-  - 360.com
+  - mvconf.f.360.cn
 domain_keyword_set:
   - apple-relay
