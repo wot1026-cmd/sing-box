@@ -9,5 +9,6 @@ domain_suffix_set:
   - apple-relay.cloudflare.com
   - mvconf.f.360.cn
   - ampaeservices.com
+  - yahoo.com
 domain_keyword_set:
   - apple-relay
