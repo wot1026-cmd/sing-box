@@ -1,9 +1,9 @@
 #!# 自动同步自 kelee.one (https://kelee.one/Tool/Loon/Lpx/Block_HTTPDNS.lpx)
-#!# 更新时间: 2026-07-29 03:00:04
+#!# 更新时间: 2026-07-31 03:00:04
 #!# 已前置插入拼多多/微信/字节系/B站(yirujs)HTTPDNS放行例外规则，并删除对应原始REJECT域名行(配套IP-CIDR规则保留)，已剔除拼多多/amdc等指定规则，格式保持Loon原生语法不变
 
 #!name=HTTPDNS拦截器(自用-排除拼多多)
-#!desc=拦截常见的HTTPDNS服务，以确保这些请求都能够在Loon的DNS框架下工作。
+#!desc=此插件是所有去广告插件的依赖，拦截常见的HTTPDNS服务，以确保这些请求都能够在Loon的DNS框架下工作。
 #!author=可莉🅥[https://github.com/luestr/ProxyResource/blob/main/README.md], VirgilClyne[https://github.com/VirgilClyne] (自用修改版，排除拼多多)
 #!homepage=https://hub.kelee.one
 #!icon=https://raw.githubusercontent.com/luestr/IconResource/main/Other_icon/120px/HTTPDNS.png
