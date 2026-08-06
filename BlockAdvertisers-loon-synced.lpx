@@ -1,5 +1,5 @@
 #!# 自动同步自 kelee.one (https://kelee.one/Tool/Loon/Lpx/BlockAdvertisers.lpx)
-#!# 更新时间: 2026-08-05 03:00:05
+#!# 更新时间: 2026-08-06 03:00:03
 #!# 已前置插入拼多多/微信/字节系/B站(yirujs)HTTPDNS放行例外规则，并删除对应原始REJECT域名行(配套IP-CIDR规则保留)，已剔除拼多多/amdc等指定规则，格式保持Loon原生语法不变
 
 #!name=广告平台拦截器(自用-排除拼多多)
