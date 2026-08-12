@@ -471,6 +471,43 @@ EOF
             cp "${backup_dir}/cf.env" "${work_dir}/cf.env"
             chmod 600 "${work_dir}/cf.env"
         fi
+
+        # ── 恢复备用协议（TUIC / Reality / AnyTLS）──
+        # inbounds.json 是按固定模板重新生成的（不是整体复制备份），
+        # 所以备用协议的 inbound 段需要从备份的 inbounds.json 里单独取出合并回来
+        if [ -f "${backup_dir}/protocols.list" ]; then
+            [ -f "${backup_dir}/reality.key" ]     && cp "${backup_dir}/reality.key" "${work_dir}/reality.key" && chmod 600 "${work_dir}/reality.key"
+            [ -f "${backup_dir}/reality.shortid" ] && cp "${backup_dir}/reality.shortid" "${work_dir}/reality.shortid" && chmod 600 "${work_dir}/reality.shortid"
+
+            local _ep_tag _ep_inbound _ep_port _ep_proto _tmp_merge
+            while IFS= read -r _ep_tag; do
+                [ -z "$_ep_tag" ] && continue
+                _ep_inbound=$(jq -c --arg t "$_ep_tag" \
+                    '.inbounds[] | select(.tag == $t)' "${backup_dir}/inbounds.json" 2>/dev/null)
+                [ -z "$_ep_inbound" ] && { yellow "备份中未找到 ${_ep_tag} 的配置，跳过恢复"; continue; }
+
+                _ep_port=$(jq -r '.listen_port' <<< "$_ep_inbound")
+                case "$_ep_tag" in tuic) _ep_proto="udp" ;; *) _ep_proto="tcp" ;; esac
+                if { [ "$_ep_proto" = udp ] && ss -ulnH | awk '{print $5}' | grep -q ":${_ep_port}$"; } \
+                   || { [ "$_ep_proto" = tcp ] && ss -tlnH | awk '{print $5}' | grep -q ":${_ep_port}$"; }; then
+                    yellow "备份中 ${_ep_tag} 端口 ${_ep_port} 已被占用，跳过恢复该协议（可安装后手动重新添加）"
+                    continue
+                fi
+
+                _tmp_merge=$(mktemp)
+                jq --argjson nb "$_ep_inbound" '.inbounds += [$nb]' \
+                    "${conf_dir}/inbounds.json" > "$_tmp_merge"
+                if [ $? -eq 0 ] && [ -s "$_tmp_merge" ]; then
+                    mv "$_tmp_merge" "${conf_dir}/inbounds.json"
+                    allow_port "${_ep_port}/${_ep_proto}"
+                    echo "$_ep_tag" >> "${work_dir}/protocols.list"
+                    green "已恢复备用协议：${_ep_tag}（端口 ${_ep_port}）"
+                else
+                    rm -f "$_tmp_merge"
+                    yellow "恢复 ${_ep_tag} 配置写入失败"
+                fi
+            done < "${backup_dir}/protocols.list"
+        fi
     fi
 
     green "sing-box 核心安装完成"
@@ -691,6 +728,9 @@ vless://${uuid}@${CFIP}:${_port}?encryption=none&security=tls&sni=${argodomain}&
 hysteria2://${hy2_password}@${server_ip}:${hy2_port}?sni=bing.com&pinSHA256=${fingerprint}&alpn=h3#${node_prefix} hy2
 EOF
     fi
+
+    # 追加备用协议链接（TUIC / Reality / AnyTLS，未安装则跳过）
+    append_extra_protocol_links "$server_ip" "$node_prefix"
 
     echo ""
     while IFS= read -r line; do
@@ -962,6 +1002,439 @@ change_config() {
         *) red "无效选项！" ;;
     esac
 }
+# =========================================================
+# 备用协议模块：TUIC v5 / VLESS-Reality / AnyTLS
+# 依赖主脚本已定义：work_dir conf_dir client_dir backup_dir
+#                    red/green/yellow/purple/skyblue/reading
+#                    command_exists allow_port remove_port
+#                    pick_free_udp_port pick_free_tcp_port
+#                    get_node_name restart_singbox check_singbox
+# =========================================================
+
+protocols_list="${work_dir}/protocols.list"
+reality_key_file="${work_dir}/reality.key"
+
+# 协议元信息：tag → 中文名 / 传输层
+declare -A EXTRA_PROTO_NAME=(
+    [tuic]="TUIC v5"
+    [reality]="VLESS-Reality"
+    [anytls]="AnyTLS"
+)
+declare -A EXTRA_PROTO_TRANSPORT=(
+    [tuic]="udp"
+    [reality]="tcp"
+    [anytls]="tcp"
+)
+# 固定展示顺序（bash 关联数组无序，遍历要用这个）
+EXTRA_PROTO_ORDER=(tuic reality anytls)
+
+# ── 协议清单读写 ──────────────────────────────────
+_ensure_protocols_list() {
+    mkdir -p "${work_dir}"
+    [ -f "$protocols_list" ] || touch "$protocols_list"
+}
+
+is_protocol_installed() {
+    local tag="$1"
+    _ensure_protocols_list
+    grep -qxF "$tag" "$protocols_list" 2>/dev/null
+}
+
+_mark_protocol_installed() {
+    local tag="$1"
+    _ensure_protocols_list
+    is_protocol_installed "$tag" || echo "$tag" >> "$protocols_list"
+}
+
+_mark_protocol_removed() {
+    local tag="$1"
+    _ensure_protocols_list
+    local tmp
+    tmp=$(mktemp)
+    grep -vxF "$tag" "$protocols_list" > "$tmp" 2>/dev/null
+    mv "$tmp" "$protocols_list"
+}
+
+# ── inbounds.json 读写工具（复用主脚本 jq 风格） ──
+_inbound_exists() {
+    local tag="$1"
+    jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' \
+        "${conf_dir}/inbounds.json" >/dev/null 2>&1
+}
+
+_add_inbound_json() {
+    # $1 = 新 inbound 的 JSON 字符串
+    local new_inbound="$1"
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson nb "$new_inbound" '.inbounds += [$nb]' \
+        "${conf_dir}/inbounds.json" > "$tmp"
+    if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "${conf_dir}/inbounds.json"
+}
+
+_remove_inbound_json() {
+    local tag="$1"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' \
+        "${conf_dir}/inbounds.json" > "$tmp"
+    if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "${conf_dir}/inbounds.json"
+}
+
+# ── Reality 密钥对：生成一次、持久化，重装时复用 ──
+_ensure_reality_keypair() {
+    if [ -s "$reality_key_file" ]; then
+        return 0
+    fi
+    if [ ! -x "${work_dir}/sing-box" ]; then
+        red "sing-box 二进制不存在，无法生成 Reality 密钥对"
+        return 1
+    fi
+    local out priv pub
+    out=$("${work_dir}/sing-box" generate reality-keypair 2>/dev/null)
+    priv=$(awk -F': ' '/PrivateKey/{print $2}' <<< "$out")
+    pub=$(awk -F': ' '/PublicKey/{print $2}'  <<< "$out")
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        red "生成 Reality 密钥对失败"
+        return 1
+    fi
+    printf '%s\n%s\n' "$priv" "$pub" > "$reality_key_file"
+    chmod 600 "$reality_key_file"
+}
+
+_reality_private_key() { sed -n '1p' "$reality_key_file" 2>/dev/null; }
+_reality_public_key()  { sed -n '2p' "$reality_key_file" 2>/dev/null; }
+
+# ── short_id：8 位十六进制，生成一次持久化到清单同目录 ──
+_reality_short_id_file="${work_dir}/reality.shortid"
+_ensure_reality_shortid() {
+    if [ -s "$_reality_short_id_file" ]; then
+        return 0
+    fi
+    openssl rand -hex 4 > "$_reality_short_id_file"
+    chmod 600 "$_reality_short_id_file"
+}
+_reality_short_id() { cat "$_reality_short_id_file" 2>/dev/null; }
+
+# =========================================================
+# add_protocol_tuic：生成 TUIC v5 inbound
+# 复用现有 cert.pem / private.key（与 Hysteria2 共用同一张自签证书）
+# =========================================================
+add_protocol_tuic() {
+    if is_protocol_installed tuic; then
+        yellow "TUIC 已安装，跳过"
+        return 0
+    fi
+    if [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+        red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
+        return 1
+    fi
+
+    local port uuid password
+    port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
+    uuid=$(cat /proc/sys/kernel/random/uuid)
+    password=$(openssl rand -hex 16)
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg pass "$password" \
+        --arg cert "${work_dir}/cert.pem" \
+        --arg key  "${work_dir}/private.key" \
+        '{
+            type: "tuic",
+            tag: "tuic",
+            listen: "0.0.0.0",
+            listen_port: $port,
+            users: [{uuid: $uuid, password: $pass}],
+            congestion_control: "bbr",
+            tls: {
+                enabled: true,
+                alpn: ["h3"],
+                certificate_path: $cert,
+                key_path: $key
+            }
+        }')
+
+    _add_inbound_json "$inbound" || { red "写入 TUIC 配置失败"; return 1; }
+    allow_port "${port}/udp"
+    _mark_protocol_installed tuic
+    green "TUIC v5 已添加，端口：${port}"
+}
+
+# =========================================================
+# add_protocol_reality：生成 VLESS-Reality inbound（不走 Argo，直连）
+# =========================================================
+add_protocol_reality() {
+    if is_protocol_installed reality; then
+        yellow "Reality 已安装，跳过"
+        return 0
+    fi
+
+    _ensure_reality_keypair || return 1
+    _ensure_reality_shortid || return 1
+
+    local port uuid sni
+    port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+    uuid=$(cat /proc/sys/kernel/random/uuid)
+    sni="www.microsoft.com"
+
+    local priv short_id
+    priv=$(_reality_private_key)
+    short_id=$(_reality_short_id)
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg sni "$sni" \
+        --arg priv "$priv" \
+        --arg sid "$short_id" \
+        '{
+            type: "vless",
+            tag: "reality",
+            listen: "0.0.0.0",
+            listen_port: $port,
+            users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+            tls: {
+                enabled: true,
+                server_name: $sni,
+                reality: {
+                    enabled: true,
+                    handshake: {server: $sni, server_port: 443},
+                    private_key: $priv,
+                    short_id: [$sid]
+                }
+            }
+        }')
+
+    _add_inbound_json "$inbound" || { red "写入 Reality 配置失败"; return 1; }
+    allow_port "${port}/tcp"
+    _mark_protocol_installed reality
+    green "VLESS-Reality 已添加，端口：${port}（直连，不走 Argo）"
+}
+
+# =========================================================
+# add_protocol_anytls：生成 AnyTLS inbound
+# 同样复用现有自签证书
+# =========================================================
+add_protocol_anytls() {
+    if is_protocol_installed anytls; then
+        yellow "AnyTLS 已安装，跳过"
+        return 0
+    fi
+    if [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+        red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
+        return 1
+    fi
+
+    local port password
+    port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+    password=$(openssl rand -hex 16)
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port "$port" \
+        --arg pass "$password" \
+        --arg cert "${work_dir}/cert.pem" \
+        --arg key  "${work_dir}/private.key" \
+        '{
+            type: "anytls",
+            tag: "anytls",
+            listen: "0.0.0.0",
+            listen_port: $port,
+            users: [{name: "user1", password: $pass}],
+            tls: {
+                enabled: true,
+                certificate_path: $cert,
+                key_path: $key
+            }
+        }')
+
+    _add_inbound_json "$inbound" || { red "写入 AnyTLS 配置失败"; return 1; }
+    allow_port "${port}/tcp"
+    _mark_protocol_installed anytls
+    green "AnyTLS 已添加，端口：${port}"
+}
+
+# =========================================================
+# remove_protocol：按 tag 精确删除单个备用协议
+# =========================================================
+remove_protocol() {
+    local tag="$1"
+    if ! is_protocol_installed "$tag"; then
+        yellow "${EXTRA_PROTO_NAME[$tag]:-$tag} 未安装，无需删除"
+        return 0
+    fi
+
+    local port proto
+    port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen_port' \
+        "${conf_dir}/inbounds.json" 2>/dev/null)
+    proto="${EXTRA_PROTO_TRANSPORT[$tag]:-tcp}"
+
+    _remove_inbound_json "$tag" || { red "删除 ${tag} 配置失败"; return 1; }
+
+    if [ -n "$port" ] && [ "$port" != "null" ]; then
+        remove_port "${port}/${proto}"
+    fi
+
+    _mark_protocol_removed "$tag"
+    green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除"
+}
+
+# =========================================================
+# 选择菜单：安装时或单独调用，多选（空格分隔）
+# =========================================================
+select_extra_protocols() {
+    clear; echo ""
+    purple "=== 选择要添加的备用协议（可多选，空格分隔，回车跳过）===\n"
+    local i=1 tag
+    for tag in "${EXTRA_PROTO_ORDER[@]}"; do
+        if is_protocol_installed "$tag"; then
+            green  "${i}. ${EXTRA_PROTO_NAME[$tag]}  [已安装]"
+        else
+            skyblue "${i}. ${EXTRA_PROTO_NAME[$tag]}"
+        fi
+        (( i++ ))
+    done
+    echo ""
+    reading "请输入序号（如: 1 3 表示装 TUIC 和 AnyTLS）: " choices
+
+    [ -z "$choices" ] && { purple "已跳过\n"; return 0; }
+
+    local c idx
+    for c in $choices; do
+        if ! [[ "$c" =~ ^[0-9]+$ ]]; then
+            yellow "忽略无效输入：${c}"
+            continue
+        fi
+        idx=$((c - 1))
+        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#EXTRA_PROTO_ORDER[@]}" ]; then
+            yellow "忽略无效序号：${c}"
+            continue
+        fi
+        tag="${EXTRA_PROTO_ORDER[$idx]}"
+        case "$tag" in
+            tuic)    add_protocol_tuic ;;
+            reality) add_protocol_reality ;;
+            anytls)  add_protocol_anytls ;;
+        esac
+    done
+
+    check_singbox &>/dev/null
+    [ $? -ne 2 ] && restart_singbox
+}
+
+# =========================================================
+# 管理菜单：查看 / 增加 / 删除
+# =========================================================
+manage_extra_protocols() {
+    check_singbox &>/dev/null
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return; }
+
+    while true; do
+        clear; echo ""
+        purple "=== 备用协议管理（TUIC / Reality / AnyTLS）===\n"
+        local i=1 tag any_installed=false
+        for tag in "${EXTRA_PROTO_ORDER[@]}"; do
+            if is_protocol_installed "$tag"; then
+                green  "${i}. ${EXTRA_PROTO_NAME[$tag]}  [已安装]"
+                any_installed=true
+            else
+                skyblue "${i}. ${EXTRA_PROTO_NAME[$tag]}  [未安装]"
+            fi
+            (( i++ ))
+        done
+        echo ""
+        green  "a. 增加协议"
+        $any_installed && red "d. 删除协议"
+        purple "0. 返回主菜单"
+        skyblue "------------"
+        reading "请输入选择: " choice
+
+        case "$choice" in
+            a|A)
+                select_extra_protocols
+                get_info
+                ;;
+            d|D)
+                if ! $any_installed; then
+                    yellow "当前没有已安装的备用协议"; sleep 1; continue
+                fi
+                reading "请输入要删除的序号（空格分隔多个，回车取消）: " del_choices
+                [ -z "$del_choices" ] && continue
+                local c idx dtag
+                for c in $del_choices; do
+                    [[ "$c" =~ ^[0-9]+$ ]] || continue
+                    idx=$((c - 1))
+                    [ "$idx" -lt 0 ] || [ "$idx" -ge "${#EXTRA_PROTO_ORDER[@]}" ] && continue
+                    dtag="${EXTRA_PROTO_ORDER[$idx]}"
+                    remove_protocol "$dtag"
+                done
+                restart_singbox
+                get_info
+                ;;
+            0) return ;;
+            *) red "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+# =========================================================
+# 生成订阅链接：追加进 client_dir（由 get_info 调用）
+# =========================================================
+append_extra_protocol_links() {
+    [ ! -f "${conf_dir}/inbounds.json" ] && return 0
+
+    local server_ip="$1"
+    local node_prefix="$2"
+
+    if is_protocol_installed tuic; then
+        local port uuid pass
+        port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json")
+        uuid=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].uuid' "${conf_dir}/inbounds.json")
+        pass=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].password' "${conf_dir}/inbounds.json")
+        # 自签证书，客户端必须 allow_insecure=1 才能连（TUIC 标准没有 pinSHA256 校验方式）
+        {
+            echo ""
+            echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&allow_insecure=1#${node_prefix} tuic"
+        } >> "${client_dir}"
+    fi
+
+    if is_protocol_installed reality; then
+        local port uuid pub sid sni
+        port=$(jq -r '.inbounds[] | select(.tag=="reality") | .listen_port' "${conf_dir}/inbounds.json")
+        uuid=$(jq -r '.inbounds[] | select(.tag=="reality") | .users[0].uuid' "${conf_dir}/inbounds.json")
+        sni=$(jq -r '.inbounds[] | select(.tag=="reality") | .tls.server_name' "${conf_dir}/inbounds.json")
+        pub=$(_reality_public_key)
+        sid=$(_reality_short_id)
+        {
+            echo ""
+            echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&flow=xtls-rprx-vision#${node_prefix} reality"
+        } >> "${client_dir}"
+    fi
+
+    if is_protocol_installed anytls; then
+        local port pass
+        port=$(jq -r '.inbounds[] | select(.tag=="anytls") | .listen_port' "${conf_dir}/inbounds.json")
+        pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
+        # 官方 URI 格式仅 anytls://password@host:port，无标准查询参数
+        # 自签证书：客户端需手动开启"跳过证书验证"，需 v2rayN 7.14.3+ / 较新 Shadowrocket/Loon 支持
+        {
+            echo ""
+            echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com#${node_prefix} anytls"
+        } >> "${client_dir}"
+    fi
+}
 
 # ── 升级 sing-box ─────────────────────────────────
 upgrade_singbox() {
@@ -1180,6 +1653,9 @@ _do_uninstall_core() {
         [ -f "${work_dir}/tunnel.json" ]     && cp "${work_dir}/tunnel.json"     "${backup_dir}/tunnel.json"
         [ -f "${work_dir}/cf.env" ]          && cp "${work_dir}/cf.env"          "${backup_dir}/cf.env"
         [ -f "${work_dir}/argo_token" ]      && cp "${work_dir}/argo_token"      "${backup_dir}/argo_token"
+        [ -f "${work_dir}/protocols.list" ]  && cp "${work_dir}/protocols.list"  "${backup_dir}/protocols.list"
+        [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
+        [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
 
         if [ -s "${backup_dir}/inbounds.json" ] && [ -s "${backup_dir}/cert.pem" ]; then
@@ -1205,6 +1681,23 @@ _do_uninstall_core() {
         remove_port "${hy2_port}/udp"
     else
         yellow "警告：无法读取 Hy2 端口，防火墙规则可能未清理，请手动检查 iptables\n"
+    fi
+
+    # 清理备用协议（TUIC / Reality / AnyTLS）占用的端口
+    if [ -f "${work_dir}/protocols.list" ]; then
+        local _ep_tag _ep_port _ep_proto
+        while IFS= read -r _ep_tag; do
+            [ -z "$_ep_tag" ] && continue
+            _ep_port=$(jq -r --arg t "$_ep_tag" '.inbounds[] | select(.tag == $t) | .listen_port' \
+                "${conf_dir}/inbounds.json" 2>/dev/null)
+            case "$_ep_tag" in
+                tuic) _ep_proto="udp" ;;
+                *)    _ep_proto="tcp" ;;
+            esac
+            if [ -n "$_ep_port" ] && [ "$_ep_port" != "null" ]; then
+                remove_port "${_ep_port}/${_ep_proto}"
+            fi
+        done < "${work_dir}/protocols.list"
     fi
 
     rm -rf "${work_dir}"
