@@ -1399,14 +1399,16 @@ append_extra_protocol_links() {
     local node_prefix="$2"
 
     if is_protocol_installed tuic; then
-        local port uuid pass
+        local port uuid pass fp
         port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json")
         uuid=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].uuid' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].password' "${conf_dir}/inbounds.json")
-        # 自签证书，客户端必须 allow_insecure=1 才能连（TUIC 标准没有 pinSHA256 校验方式）
+        fp=$(get_hy2_fingerprint)
+        # Egern 支持 pinSHA256 校验自签证书；其他客户端若不支持该字段，
+        # 需手动改用 allow_insecure=1 跳过验证
         {
             echo ""
-            echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&allow_insecure=1#${node_prefix} tuic"
+            echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&pinSHA256=${fp}#${node_prefix} tuic"
         } >> "${client_dir}"
     fi
 
@@ -1424,14 +1426,15 @@ append_extra_protocol_links() {
     fi
 
     if is_protocol_installed anytls; then
-        local port pass
+        local port pass fp
         port=$(jq -r '.inbounds[] | select(.tag=="anytls") | .listen_port' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
-        # 官方 URI 格式仅 anytls://password@host:port，无标准查询参数
-        # 自签证书：客户端需手动开启"跳过证书验证"，需 v2rayN 7.14.3+ / 较新 Shadowrocket/Loon 支持
+        fp=$(get_hy2_fingerprint)
+        # 官方 URI 标准仅 anytls://password@host:port，pinSHA256 是 Egern 的扩展字段，
+        # 非 Egern 客户端（如老版本 v2rayN/Shadowrocket）可能不识别，需手动改成跳过证书验证
         {
             echo ""
-            echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com#${node_prefix} anytls"
+            echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com&pinSHA256=${fp}#${node_prefix} anytls"
         } >> "${client_dir}"
     fi
 }
@@ -2236,6 +2239,8 @@ menu() {
     purple "12. 网络调优 (BBR)"
     purple "13. DNS 管理"
     echo   "==============="
+    green  "14. 备用协议管理 (TUIC/Reality/AnyTLS)"
+    echo   "==============="
     red    "0. 退出脚本"
     echo   "==========="
 }
@@ -2582,7 +2587,7 @@ case "$1" in
     "")
         while true; do
             menu
-            reading "请输入选择(0-13): " choice
+            reading "请输入选择(0-14): " choice
             echo ""
             need_pause=true
             case "$choice" in
@@ -2607,11 +2612,12 @@ case "$1" in
                     bash <(curl -fsSL https://ssh_tool.eooce.com)
                     need_pause=false
                     ;;
-                11) manage_fail2ban; need_pause=true ;;
-                12) bbr_tune_menu;   need_pause=true ;;
-                13) dns_menu;        need_pause=true ;;
+                11) manage_fail2ban;        need_pause=true ;;
+                12) bbr_tune_menu;          need_pause=true ;;
+                13) dns_menu;               need_pause=true ;;
+                14) manage_extra_protocols; need_pause=true ;;
                 0) exit 0 ;;
-                *) red "无效选项，请输入 0-13" ;;
+                *) red "无效选项，请输入 0-14" ;;
             esac
             [ "$need_pause" = true ] && read -n1 -s -r -p $'\033[1;91m按任意键返回…\033[0m'
             echo ""
