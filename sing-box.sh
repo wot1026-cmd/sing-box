@@ -1292,7 +1292,8 @@ add_protocol_reality() {
     local port uuid sni
     port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
     uuid=$(cat /proc/sys/kernel/random/uuid)
-    sni="www.microsoft.com"
+    # www.microsoft.com 实测在部分客户端（v2rayN）握手失败，改用 apple.com（已实测多端可连）
+    sni="www.apple.com"
 
     local priv short_id
     priv=$(_reality_private_key)
@@ -1547,6 +1548,7 @@ append_extra_protocol_links() {
 
     local server_ip="$1"
     local node_prefix="$2"
+    local ip_links="" domain_links=""
 
     _protocol_uses_acme() {
         [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$1" "${work_dir}/protocols_acme.list" 2>/dev/null
@@ -1560,22 +1562,14 @@ append_extra_protocol_links() {
         if _protocol_uses_acme tuic; then
             sni=$(jq -r '.inbounds[] | select(.tag=="tuic") | .tls.server_name' "${conf_dir}/inbounds.json")
             # acme 真实证书，标准 TLS 验证，无需 insecure/指纹参数
-            # 提供两条：IP 直连（更稳，不依赖 DNS 解析）+ 域名连接（IP 变更后仅需改 DNS，无需重发链接）
-            {
-                echo ""
-                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-ip"
-                echo ""
-                echo "tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-domain"
-            } >> "${client_dir}"
+            ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-ip"
+            domain_links+=$'\n'"tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-domain"
         else
             # 实测：pinSHA256 在 Egern / v2rayN 的 TUIC 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，三个字段名同写以兼容不同客户端。
             # 如需指纹校验，请导入后在客户端内手动填写证书指纹并关闭"跳过验证"，
             # 指纹可通过菜单"5. 刷新节点信息"输出中查看，与 hy2/anytls 共用同一张证书。
-            {
-                echo ""
-                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&insecure=1&allowInsecure=1&allow_insecure=1#${node_prefix} tuic"
-            } >> "${client_dir}"
+            ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&insecure=1&allowInsecure=1&allow_insecure=1#${node_prefix} tuic"
         fi
     fi
 
@@ -1586,10 +1580,8 @@ append_extra_protocol_links() {
         sni=$(jq -r '.inbounds[] | select(.tag=="reality") | .tls.server_name' "${conf_dir}/inbounds.json")
         pub=$(_reality_public_key)
         sid=$(_reality_short_id)
-        {
-            echo ""
-            echo "vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${node_prefix} reality"
-        } >> "${client_dir}"
+        # Reality 走伪装握手，本身不依赖真实域名解析，始终只用 IP 直连
+        ip_links+=$'\n'"vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${node_prefix} reality"
     fi
 
     if is_protocol_installed anytls; then
@@ -1598,23 +1590,31 @@ append_extra_protocol_links() {
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
         if _protocol_uses_acme anytls; then
             sni=$(jq -r '.inbounds[] | select(.tag=="anytls") | .tls.server_name' "${conf_dir}/inbounds.json")
-            # 提供两条：IP 直连（更稳，不依赖 DNS 解析）+ 域名连接（IP 变更后仅需改 DNS，无需重发链接）
-            {
-                echo ""
-                echo "anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls-ip"
-                echo ""
-                echo "anytls://${pass}@${sni}:${port}?sni=${sni}#${node_prefix} anytls-domain"
-            } >> "${client_dir}"
+            ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls-ip"
+            domain_links+=$'\n'"anytls://${pass}@${sni}:${port}?sni=${sni}#${node_prefix} anytls-domain"
         else
             # 实测：pinSHA256/hpkp/pcs 等指纹字段在 Egern / v2rayN 的 AnyTLS 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，两个字段名同写以兼容不同客户端。
             # 如需指纹校验，请导入后在客户端内手动填写证书指纹并关闭"跳过验证"，
             # 指纹可通过菜单"5. 刷新节点信息"输出中查看，与 hy2/tuic 共用同一张证书。
-            {
-                echo ""
-                echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com&insecure=1&allowInsecure=1#${node_prefix} anytls"
-            } >> "${client_dir}"
+            ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=bing.com&insecure=1&allowInsecure=1#${node_prefix} anytls"
         fi
+    fi
+
+    if [ -n "$ip_links" ]; then
+        {
+            echo ""
+            echo "───── IP 直连（推荐，不依赖 DNS）─────"
+            echo "$ip_links"
+        } >> "${client_dir}"
+    fi
+
+    if [ -n "$domain_links" ]; then
+        {
+            echo ""
+            echo "───── 域名连接（IP 变更后仅需改 DNS，无需重发链接）─────"
+            echo "$domain_links"
+        } >> "${client_dir}"
     fi
 }
 
