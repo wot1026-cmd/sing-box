@@ -501,7 +501,12 @@ EOF
                     mv "$_tmp_merge" "${conf_dir}/inbounds.json"
                     allow_port "${_ep_port}/${_ep_proto}"
                     echo "$_ep_tag" >> "${work_dir}/protocols.list"
-                    green "已恢复备用协议：${_ep_tag}（端口 ${_ep_port}）"
+                    if [ -f "${backup_dir}/protocols_acme.list" ] && grep -qxF "$_ep_tag" "${backup_dir}/protocols_acme.list"; then
+                        echo "$_ep_tag" >> "${work_dir}/protocols_acme.list"
+                        green "已恢复备用协议：${_ep_tag}（端口 ${_ep_port}，acme 证书）"
+                    else
+                        green "已恢复备用协议：${_ep_tag}（端口 ${_ep_port}，自签证书）"
+                    fi
                 else
                     rm -f "$_tmp_merge"
                     yellow "恢复 ${_ep_tag} 配置写入失败"
@@ -1125,15 +1130,81 @@ _ensure_reality_shortid() {
 _reality_short_id() { cat "$_reality_short_id_file" 2>/dev/null; }
 
 # =========================================================
+# acme 证书配置：TUIC / AnyTLS 共用
+# 优先用 cf.env 里已保存的 CF_ACME_TOKEN / CF_ACME_DOMAIN；
+# 没有则询问一次是否设置；用户选择跳过则回退自签证书 + insecure
+# =========================================================
+_read_cf_env_key() {
+    local key="$1"
+    [ -f "${work_dir}/cf.env" ] || return 1
+    grep "^${key}=" "${work_dir}/cf.env" | cut -d'=' -f2-
+}
+
+_write_cf_env_key() {
+    local key="$1" val="$2"
+    _ensure_protocols_list  # 顺带确保 work_dir 存在
+    touch "${work_dir}/cf.env"
+    if grep -q "^${key}=" "${work_dir}/cf.env" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "${work_dir}/cf.env"
+    else
+        echo "${key}=${val}" >> "${work_dir}/cf.env"
+    fi
+    chmod 600 "${work_dir}/cf.env"
+}
+
+# 返回值：0 = 已配置 acme（供调用方读取 CF_ACME_TOKEN/CF_ACME_DOMAIN）
+#         1 = 用户选择跳过，使用自签证书
+ensure_acme_config() {
+    local token domain acme_choice
+    token=$(_read_cf_env_key CF_ACME_TOKEN)
+    domain=$(_read_cf_env_key CF_ACME_DOMAIN)
+    if [ -n "$token" ] && [ -n "$domain" ]; then
+        return 0
+    fi
+
+    echo ""
+    purple "该协议需要 TLS 证书。可选择：\n"
+    skyblue "1. 使用 acme 自动申请真实证书（需域名 + Cloudflare API Token，DNS 记录须为“仅 DNS”不走代理）"
+    skyblue "2. 使用自签证书（客户端需 insecure=1 跳过验证，配置更快）"
+    reading "请选择 (1/2，回车默认 2): " acme_choice
+
+    if [ "$acme_choice" != "1" ]; then
+        return 1
+    fi
+
+    reading "请输入用于该协议的子域名（如 dedirock.102689.xyz，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
+    if [ -z "$domain" ]; then
+        yellow "域名为空，回退使用自签证书"
+        return 1
+    fi
+    reading "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名）: " token
+    if [ -z "$token" ]; then
+        yellow "Token 为空，回退使用自签证书"
+        return 1
+    fi
+
+    _write_cf_env_key CF_ACME_TOKEN "$token"
+    _write_cf_env_key CF_ACME_DOMAIN "$domain"
+    green "acme 配置已保存（${work_dir}/cf.env，权限 600）"
+    return 0
+}
+
+# =========================================================
 # add_protocol_tuic：生成 TUIC v5 inbound
-# 复用现有 cert.pem / private.key（与 Hysteria2 共用同一张自签证书）
+# 优先 acme 真实证书；否则回退复用现有自签 cert.pem / private.key
 # =========================================================
 add_protocol_tuic() {
     if is_protocol_installed tuic; then
         yellow "TUIC 已安装，跳过"
         return 0
     fi
-    if [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+
+    local use_acme=false acme_domain acme_token
+    if ensure_acme_config; then
+        use_acme=true
+        acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
+        acme_token=$(_read_cf_env_key CF_ACME_TOKEN)
+    elif [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
         red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
         return 1
     fi
@@ -1144,31 +1215,66 @@ add_protocol_tuic() {
     password=$(openssl rand -hex 16)
 
     local inbound
-    inbound=$(jq -n \
-        --argjson port "$port" \
-        --arg uuid "$uuid" \
-        --arg pass "$password" \
-        --arg cert "${work_dir}/cert.pem" \
-        --arg key  "${work_dir}/private.key" \
-        '{
-            type: "tuic",
-            tag: "tuic",
-            listen: "0.0.0.0",
-            listen_port: $port,
-            users: [{uuid: $uuid, password: $pass}],
-            congestion_control: "bbr",
-            tls: {
-                enabled: true,
-                alpn: ["h3"],
-                certificate_path: $cert,
-                key_path: $key
-            }
-        }')
+    if $use_acme; then
+        inbound=$(jq -n \
+            --argjson port "$port" \
+            --arg uuid "$uuid" \
+            --arg pass "$password" \
+            --arg domain "$acme_domain" \
+            --arg token "$acme_token" \
+            '{
+                type: "tuic",
+                tag: "tuic",
+                listen: "0.0.0.0",
+                listen_port: $port,
+                users: [{uuid: $uuid, password: $pass}],
+                congestion_control: "bbr",
+                tls: {
+                    enabled: true,
+                    server_name: $domain,
+                    alpn: ["h3"],
+                    acme: {
+                        domain: $domain,
+                        email: ("acme@" + $domain),
+                        dns01_challenge: {
+                            provider: "cloudflare",
+                            api_token: $token
+                        }
+                    }
+                }
+            }')
+    else
+        inbound=$(jq -n \
+            --argjson port "$port" \
+            --arg uuid "$uuid" \
+            --arg pass "$password" \
+            --arg cert "${work_dir}/cert.pem" \
+            --arg key  "${work_dir}/private.key" \
+            '{
+                type: "tuic",
+                tag: "tuic",
+                listen: "0.0.0.0",
+                listen_port: $port,
+                users: [{uuid: $uuid, password: $pass}],
+                congestion_control: "bbr",
+                tls: {
+                    enabled: true,
+                    alpn: ["h3"],
+                    certificate_path: $cert,
+                    key_path: $key
+                }
+            }')
+    fi
 
     _add_inbound_json "$inbound" || { red "写入 TUIC 配置失败"; return 1; }
     allow_port "${port}/udp"
     _mark_protocol_installed tuic
-    green "TUIC v5 已添加，端口：${port}"
+    if $use_acme; then
+        echo "tuic" >> "${work_dir}/protocols_acme.list"
+        green "TUIC v5 已添加，端口：${port}（acme 证书：${acme_domain}）"
+    else
+        green "TUIC v5 已添加，端口：${port}（自签证书）"
+    fi
 }
 
 # =========================================================
@@ -1225,14 +1331,20 @@ add_protocol_reality() {
 
 # =========================================================
 # add_protocol_anytls：生成 AnyTLS inbound
-# 同样复用现有自签证书
+# 优先 acme 真实证书；否则回退复用现有自签证书
 # =========================================================
 add_protocol_anytls() {
     if is_protocol_installed anytls; then
         yellow "AnyTLS 已安装，跳过"
         return 0
     fi
-    if [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+
+    local use_acme=false acme_domain acme_token
+    if ensure_acme_config; then
+        use_acme=true
+        acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
+        acme_token=$(_read_cf_env_key CF_ACME_TOKEN)
+    elif [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
         red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
         return 1
     fi
@@ -1242,28 +1354,60 @@ add_protocol_anytls() {
     password=$(openssl rand -hex 16)
 
     local inbound
-    inbound=$(jq -n \
-        --argjson port "$port" \
-        --arg pass "$password" \
-        --arg cert "${work_dir}/cert.pem" \
-        --arg key  "${work_dir}/private.key" \
-        '{
-            type: "anytls",
-            tag: "anytls",
-            listen: "0.0.0.0",
-            listen_port: $port,
-            users: [{name: "user1", password: $pass}],
-            tls: {
-                enabled: true,
-                certificate_path: $cert,
-                key_path: $key
-            }
-        }')
+    if $use_acme; then
+        inbound=$(jq -n \
+            --argjson port "$port" \
+            --arg pass "$password" \
+            --arg domain "$acme_domain" \
+            --arg token "$acme_token" \
+            '{
+                type: "anytls",
+                tag: "anytls",
+                listen: "0.0.0.0",
+                listen_port: $port,
+                users: [{name: "user1", password: $pass}],
+                tls: {
+                    enabled: true,
+                    server_name: $domain,
+                    acme: {
+                        domain: $domain,
+                        email: ("acme@" + $domain),
+                        dns01_challenge: {
+                            provider: "cloudflare",
+                            api_token: $token
+                        }
+                    }
+                }
+            }')
+    else
+        inbound=$(jq -n \
+            --argjson port "$port" \
+            --arg pass "$password" \
+            --arg cert "${work_dir}/cert.pem" \
+            --arg key  "${work_dir}/private.key" \
+            '{
+                type: "anytls",
+                tag: "anytls",
+                listen: "0.0.0.0",
+                listen_port: $port,
+                users: [{name: "user1", password: $pass}],
+                tls: {
+                    enabled: true,
+                    certificate_path: $cert,
+                    key_path: $key
+                }
+            }')
+    fi
 
     _add_inbound_json "$inbound" || { red "写入 AnyTLS 配置失败"; return 1; }
     allow_port "${port}/tcp"
     _mark_protocol_installed anytls
-    green "AnyTLS 已添加，端口：${port}"
+    if $use_acme; then
+        echo "anytls" >> "${work_dir}/protocols_acme.list"
+        green "AnyTLS 已添加，端口：${port}（acme 证书：${acme_domain}）"
+    else
+        green "AnyTLS 已添加，端口：${port}（自签证书）"
+    fi
 }
 
 # =========================================================
@@ -1288,6 +1432,12 @@ remove_protocol() {
     fi
 
     _mark_protocol_removed "$tag"
+    if [ -f "${work_dir}/protocols_acme.list" ]; then
+        local _tmp
+        _tmp=$(mktemp)
+        grep -vxF "$tag" "${work_dir}/protocols_acme.list" > "$_tmp" 2>/dev/null
+        mv "$_tmp" "${work_dir}/protocols_acme.list"
+    fi
     green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除"
 }
 
@@ -1398,18 +1548,32 @@ append_extra_protocol_links() {
     local server_ip="$1"
     local node_prefix="$2"
 
+    _protocol_uses_acme() {
+        [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$1" "${work_dir}/protocols_acme.list" 2>/dev/null
+    }
+
     if is_protocol_installed tuic; then
-        local port uuid pass fp
+        local port uuid pass sni
         port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json")
         uuid=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].uuid' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].password' "${conf_dir}/inbounds.json")
-        fp=$(get_hy2_fingerprint)
-        # Egern 支持 pinSHA256 校验自签证书；其他客户端若不支持该字段，
-        # 需手动改用 allow_insecure=1 跳过验证
-        {
-            echo ""
-            echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&pinSHA256=${fp}#${node_prefix} tuic"
-        } >> "${client_dir}"
+        if _protocol_uses_acme tuic; then
+            sni=$(jq -r '.inbounds[] | select(.tag=="tuic") | .tls.server_name' "${conf_dir}/inbounds.json")
+            # acme 真实证书，标准 TLS 验证，无需 insecure/指纹参数
+            {
+                echo ""
+                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic"
+            } >> "${client_dir}"
+        else
+            # 实测：pinSHA256 在 Egern / v2rayN 的 TUIC 解析器里均不生效（2026-08 验证）。
+            # 自签证书场景下必须显式 insecure=1，三个字段名同写以兼容不同客户端。
+            # 如需指纹校验，请导入后在客户端内手动填写证书指纹并关闭"跳过验证"，
+            # 指纹可通过菜单"5. 刷新节点信息"输出中查看，与 hy2/anytls 共用同一张证书。
+            {
+                echo ""
+                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=bing.com&alpn=h3&congestion_control=bbr&insecure=1&allowInsecure=1&allow_insecure=1#${node_prefix} tuic"
+            } >> "${client_dir}"
+        fi
     fi
 
     if is_protocol_installed reality; then
@@ -1421,21 +1585,30 @@ append_extra_protocol_links() {
         sid=$(_reality_short_id)
         {
             echo ""
-            echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&flow=xtls-rprx-vision#${node_prefix} reality"
+            echo "vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${node_prefix} reality"
         } >> "${client_dir}"
     fi
 
     if is_protocol_installed anytls; then
-        local port pass fp
+        local port pass sni
         port=$(jq -r '.inbounds[] | select(.tag=="anytls") | .listen_port' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
-        fp=$(get_hy2_fingerprint)
-        # 官方 URI 标准仅 anytls://password@host:port，pinSHA256 是 Egern 的扩展字段，
-        # 非 Egern 客户端（如老版本 v2rayN/Shadowrocket）可能不识别，需手动改成跳过证书验证
-        {
-            echo ""
-            echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com&pinSHA256=${fp}#${node_prefix} anytls"
-        } >> "${client_dir}"
+        if _protocol_uses_acme anytls; then
+            sni=$(jq -r '.inbounds[] | select(.tag=="anytls") | .tls.server_name' "${conf_dir}/inbounds.json")
+            {
+                echo ""
+                echo "anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls"
+            } >> "${client_dir}"
+        else
+            # 实测：pinSHA256/hpkp/pcs 等指纹字段在 Egern / v2rayN 的 AnyTLS 解析器里均不生效（2026-08 验证）。
+            # 自签证书场景下必须显式 insecure=1，两个字段名同写以兼容不同客户端。
+            # 如需指纹校验，请导入后在客户端内手动填写证书指纹并关闭"跳过验证"，
+            # 指纹可通过菜单"5. 刷新节点信息"输出中查看，与 hy2/tuic 共用同一张证书。
+            {
+                echo ""
+                echo "anytls://${pass}@${server_ip}:${port}?sni=bing.com&insecure=1&allowInsecure=1#${node_prefix} anytls"
+            } >> "${client_dir}"
+        fi
     fi
 }
 
@@ -1657,6 +1830,7 @@ _do_uninstall_core() {
         [ -f "${work_dir}/cf.env" ]          && cp "${work_dir}/cf.env"          "${backup_dir}/cf.env"
         [ -f "${work_dir}/argo_token" ]      && cp "${work_dir}/argo_token"      "${backup_dir}/argo_token"
         [ -f "${work_dir}/protocols.list" ]  && cp "${work_dir}/protocols.list"  "${backup_dir}/protocols.list"
+        [ -f "${work_dir}/protocols_acme.list" ] && cp "${work_dir}/protocols_acme.list" "${backup_dir}/protocols_acme.list"
         [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
         [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
