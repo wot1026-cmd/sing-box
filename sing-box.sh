@@ -288,10 +288,10 @@ install_singbox() {
     fi
 
     if $restore_backup; then
-        uuid=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid' "${backup_dir}/inbounds.json")
-        vless_path=$(jq -r '.inbounds[] | select(.type=="vless") | .transport.path' "${backup_dir}/inbounds.json")
+        uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .users[0].uuid' "${backup_dir}/inbounds.json")
+        vless_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .transport.path' "${backup_dir}/inbounds.json")
         hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "${backup_dir}/inbounds.json")
-        argo_port=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port' "${backup_dir}/inbounds.json")
+        argo_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .listen_port' "${backup_dir}/inbounds.json")
         hy2_password=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "${backup_dir}/inbounds.json")
         # 兼容旧备份（密码与UUID相同的历史配置）：若读取失败则回退使用 uuid
         [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ] && hy2_password="$uuid"
@@ -695,7 +695,7 @@ get_info() {
 
     local hy2_port uuid hy2_password fingerprint
     hy2_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "${conf_dir}/inbounds.json")
-    uuid=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid' "${conf_dir}/inbounds.json")
+    uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .users[0].uuid' "${conf_dir}/inbounds.json")
     hy2_password=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "${conf_dir}/inbounds.json")
     # 兼容旧配置（密码与UUID相同的历史配置）：若读取失败则回退使用 uuid
     [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ] && hy2_password="$uuid"
@@ -707,7 +707,7 @@ get_info() {
     fi
 
     local vless_path
-    vless_path=$(jq -r '.inbounds[] | select(.type=="vless") | .transport.path' "${conf_dir}/inbounds.json" \
+    vless_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .transport.path' "${conf_dir}/inbounds.json" \
         | sed 's|^/||')
 
     local argodomain=""
@@ -867,10 +867,10 @@ change_config() {
             fi
             local tmp_file
             tmp_file=$(mktemp)
-            # 仅修改 VLESS 的 UUID 和 path，不再覆盖 hy2 密码（hy2 密码独立维护）
+            # 仅修改 Argo VLESS 的 UUID 和 path（按 tag 精确匹配，避免误改 Reality 的 vless inbound）
             jq --arg u "$new_uuid" --arg p "/${new_uuid}-vless" '
-                (.inbounds[] | select(.type=="vless") | .users[] | .uuid) = $u |
-                (.inbounds[] | select(.type=="vless") | .transport.path) = $p
+                (.inbounds[] | select(.tag=="vless-ws") | .users[] | .uuid) = $u |
+                (.inbounds[] | select(.tag=="vless-ws") | .transport.path) = $p
             ' "$inbounds_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
                 rm -f "$tmp_file"; red "配置文件写入失败，请检查！"; sleep 2; return
@@ -959,7 +959,7 @@ change_config() {
             local tmp_file
             tmp_file=$(mktemp)
             jq --argjson p "$new_port" \
-                '(.inbounds[] | select(.type=="vless") | .listen_port) = $p' \
+                '(.inbounds[] | select(.tag=="vless-ws") | .listen_port) = $p' \
                 "$inbounds_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
                 rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return
@@ -1696,7 +1696,7 @@ configure_fixed_tunnel() {
     [ -z "$argo_auth" ] && { red "密钥不能为空"; return 1; }
 
     local current_argo_port
-    current_argo_port=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
+    current_argo_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
     [[ "$current_argo_port" =~ ^[0-9]+$ ]] || current_argo_port="${ARGO_PORT}"
     yellow "当前 VLESS 端口: ${current_argo_port}\n"
 
