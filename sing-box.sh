@@ -1056,8 +1056,10 @@ _mark_protocol_removed() {
     _ensure_protocols_list
     local tmp
     tmp=$(mktemp)
-    grep -vxF "$tag" "$protocols_list" > "$tmp" 2>/dev/null
-    mv "$tmp" "$protocols_list"
+    if [ -n "$tmp" ]; then
+        grep -vxF "$tag" "$protocols_list" > "$tmp" 2>/dev/null
+        mv "$tmp" "$protocols_list"
+    fi
 }
 
 # ── inbounds.json 读写工具（复用主脚本 jq 风格） ──
@@ -1175,6 +1177,10 @@ ensure_acme_config() {
     reading "请输入用于该协议的子域名（如 node1.yourdomain.com，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
     if [ -z "$domain" ]; then
         yellow "域名为空，回退使用自签证书"
+        return 1
+    fi
+    if ! [[ "$domain" =~ ^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$ ]]; then
+        yellow "域名格式不合法，回退使用自签证书"
         return 1
     fi
     reading "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名）: " token
@@ -1436,8 +1442,10 @@ remove_protocol() {
     if [ -f "${work_dir}/protocols_acme.list" ]; then
         local _tmp
         _tmp=$(mktemp)
-        grep -vxF "$tag" "${work_dir}/protocols_acme.list" > "$_tmp" 2>/dev/null
-        mv "$_tmp" "${work_dir}/protocols_acme.list"
+        if [ -n "$_tmp" ]; then
+            grep -vxF "$tag" "${work_dir}/protocols_acme.list" > "$_tmp" 2>/dev/null
+            mv "$_tmp" "${work_dir}/protocols_acme.list"
+        fi
     fi
     green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除"
 }
@@ -1543,16 +1551,16 @@ manage_extra_protocols() {
 # =========================================================
 # 生成订阅链接：追加进 client_dir（由 get_info 调用）
 # =========================================================
+_protocol_uses_acme() {
+    [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$1" "${work_dir}/protocols_acme.list" 2>/dev/null
+}
+
 append_extra_protocol_links() {
     [ ! -f "${conf_dir}/inbounds.json" ] && return 0
 
     local server_ip="$1"
     local node_prefix="$2"
     local ip_links="" domain_links=""
-
-    _protocol_uses_acme() {
-        [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$1" "${work_dir}/protocols_acme.list" 2>/dev/null
-    }
 
     if is_protocol_installed tuic; then
         local port uuid pass sni
