@@ -1560,9 +1560,12 @@ append_extra_protocol_links() {
         if _protocol_uses_acme tuic; then
             sni=$(jq -r '.inbounds[] | select(.tag=="tuic") | .tls.server_name' "${conf_dir}/inbounds.json")
             # acme 真实证书，标准 TLS 验证，无需 insecure/指纹参数
+            # 提供两条：IP 直连（更稳，不依赖 DNS 解析）+ 域名连接（IP 变更后仅需改 DNS，无需重发链接）
             {
                 echo ""
-                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic"
+                echo "tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-ip"
+                echo ""
+                echo "tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-domain"
             } >> "${client_dir}"
         else
             # 实测：pinSHA256 在 Egern / v2rayN 的 TUIC 解析器里均不生效（2026-08 验证）。
@@ -1595,9 +1598,12 @@ append_extra_protocol_links() {
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
         if _protocol_uses_acme anytls; then
             sni=$(jq -r '.inbounds[] | select(.tag=="anytls") | .tls.server_name' "${conf_dir}/inbounds.json")
+            # 提供两条：IP 直连（更稳，不依赖 DNS 解析）+ 域名连接（IP 变更后仅需改 DNS，无需重发链接）
             {
                 echo ""
-                echo "anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls"
+                echo "anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls-ip"
+                echo ""
+                echo "anytls://${pass}@${sni}:${port}?sni=${sni}#${node_prefix} anytls-domain"
             } >> "${client_dir}"
         else
             # 实测：pinSHA256/hpkp/pcs 等指纹字段在 Egern / v2rayN 的 AnyTLS 解析器里均不生效（2026-08 验证）。
