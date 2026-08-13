@@ -1172,7 +1172,7 @@ ensure_acme_config() {
         return 1
     fi
 
-    reading "请输入用于该协议的子域名（如 dedirock.102689.xyz，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
+    reading "请输入用于该协议的子域名（如 node1.yourdomain.com，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
     if [ -z "$domain" ]; then
         yellow "域名为空，回退使用自签证书"
         return 1
