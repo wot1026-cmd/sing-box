@@ -2524,6 +2524,23 @@ EOF
         iptables -A INPUT -p udp --dport "$hy2_port_reapply" -j ACCEPT 2>/dev/null || true
     fi
 
+    # ── 9b. 放行备用协议端口（TUIC / Reality / AnyTLS）──
+    # 本函数会清空重建整条 INPUT 链，之前 install_singbox() 恢复备份时
+    # 调用 allow_port 加的规则会被这里的 flush 冲掉，必须在重建后再放行一次，
+    # 否则会依赖第 10 步的人工确认兜底才能补上（如遇到这种情况请检查此处逻辑）。
+    if [ -f "${work_dir}/protocols.list" ]; then
+        local _fw_tag _fw_port _fw_proto
+        while IFS= read -r _fw_tag; do
+            [ -z "$_fw_tag" ] && continue
+            _fw_port=$(jq -r --arg t "$_fw_tag" '.inbounds[] | select(.tag == $t) | .listen_port' \
+                "${conf_dir}/inbounds.json" 2>/dev/null)
+            case "$_fw_tag" in tuic) _fw_proto="udp" ;; *) _fw_proto="tcp" ;; esac
+            if [ -n "$_fw_port" ] && [ "$_fw_port" != "null" ]; then
+                iptables -A INPUT -p "$_fw_proto" --dport "$_fw_port" -j ACCEPT 2>/dev/null || true
+            fi
+        done < "${work_dir}/protocols.list"
+    fi
+
     # ── 10. 扫描其他公网监听端口（只检测 IPv4）──
     local accepted4_tcp accepted4_udp
     accepted4_tcp=$(iptables -S INPUT 2>/dev/null \
