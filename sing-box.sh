@@ -1569,9 +1569,10 @@ append_extra_protocol_links() {
         pass=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].password' "${conf_dir}/inbounds.json")
         if _protocol_uses_acme tuic; then
             sni=$(jq -r '.inbounds[] | select(.tag=="tuic") | .tls.server_name' "${conf_dir}/inbounds.json")
-            # acme 真实证书，标准 TLS 验证，无需 insecure/指纹参数
-            ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-ip"
-            domain_links+=$'\n'"tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr#${node_prefix} tuic-domain"
+            # acme 真实证书，标准 TLS 验证。显式写 insecure=0（而非省略该字段），
+            # 避免依赖客户端在字段缺省时的隐含默认行为（勇哥/fscarmen 脚本同样显式写 0，已验证更可靠）。
+            ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-ip"
+            domain_links+=$'\n'"tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-domain"
         else
             # 实测：pinSHA256 在 Egern / v2rayN 的 TUIC 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，三个字段名同写以兼容不同客户端。
@@ -1598,8 +1599,11 @@ append_extra_protocol_links() {
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
         if _protocol_uses_acme anytls; then
             sni=$(jq -r '.inbounds[] | select(.tag=="anytls") | .tls.server_name' "${conf_dir}/inbounds.json")
-            ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=${sni}#${node_prefix} anytls-ip"
-            domain_links+=$'\n'"anytls://${pass}@${sni}:${port}?sni=${sni}#${node_prefix} anytls-domain"
+            # acme 真实证书，标准 TLS 验证。显式写 insecure=0，避免依赖客户端缺省行为
+            # （实测 Egern 在 anytls:// 链接缺省 insecure 字段时，界面会显示"跳过验证=开"，
+            # 显式写 0 后应能纠正该显示状态，参考勇哥脚本同款写法）。
+            ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-ip"
+            domain_links+=$'\n'"anytls://${pass}@${sni}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-domain"
         else
             # 实测：pinSHA256/hpkp/pcs 等指纹字段在 Egern / v2rayN 的 AnyTLS 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，两个字段名同写以兼容不同客户端。
