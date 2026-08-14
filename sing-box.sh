@@ -2754,7 +2754,13 @@ do_install() {
     green "\nsing-box 安装完成！"
 
     if is_fixed_tunnel_configured && [ "${TUNNEL_FULLY_RESTORED}" = true ]; then
-        green "Argo 固定隧道已完整恢复"
+        # sing-box 在装机流程中被重启过（大陆拦截配置、防火墙等步骤），
+        # 但 argo 隧道服务此前一直在跑、没有跟着重启，它与本地 sing-box 之间
+        # 的连接会停留在旧进程上，导致隧道能连通 Cloudflare 边缘节点、
+        # 但转发到本地 vless-ws 时失败（journalctl -u argo 可见 "context canceled"）。
+        # 此处显式重启 argo，让它与新启动的 sing-box 进程重新建立本地连接。
+        restart_argo
+        green "Argo 固定隧道已完整恢复（已同步重启 argo 服务）"
         get_info
     elif is_fixed_tunnel_configured && [ "${TUNNEL_TOKEN_MODE}" = true ]; then
         yellow "检测到 Token 模式隧道备份，域名：$(get_fixed_domain)"
