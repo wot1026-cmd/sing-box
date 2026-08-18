@@ -1225,7 +1225,10 @@ _ensure_acme_sh_installed() {
         return 0
     fi
     yellow "首次使用 acme.sh，正在安装…"
-    if ! curl -fsSL https://get.acme.sh | sh -s email="acme@$(hostname -f 2>/dev/null || echo local)" >/dev/null 2>&1; then
+    # 不传 email 参数：acme.sh 官方文档确认该参数默认即为空，不是必需项。
+    # 曾尝试用 hostname -f 拼邮箱，但多数云 VPS 的 hostname -f 只返回短主机名（如 "74"），
+    # 拼出的 "acme@74" 不是合法邮箱格式，可能导致 CA 账号注册被拒——不传更安全。
+    if ! curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1; then
         red "acme.sh 安装失败，请检查网络"
         return 1
     fi
@@ -1286,7 +1289,25 @@ _acme_sh_issue_cert() {
     fi
 
     green "acme.sh 证书已就绪：${cert_dir}（自动续期由 acme.sh 自带 cron 处理）"
+
+    _ensure_acme_sync_cron "$domain"
     return 0
+}
+
+# 独立于 acme.sh 自带的 reloadcmd 机制，额外加一道保险：
+# 部分环境下 acme.sh 续期时不会按预期重新执行 install-cert（社区有相关反馈，
+# 行为不完全可靠），若证书续期了但未同步到 certificate_path 指向的文件，
+# sing-box 会一直用旧证书直到过期。此处每天定时主动重新执行一次 install-cert，
+# 把最新证书强制同步到目标路径，即使 reloadcmd 没触发也能兜底。
+_ensure_acme_sync_cron() {
+    local domain="$1"
+    local marker="# sing-box-extra-protocols acme sync: ${domain}"
+    if crontab -l 2>/dev/null | grep -qF "$marker"; then
+        return 0
+    fi
+    local cert_dir="${work_dir}/acme/${domain}"
+    local sync_cmd="CF_Token=\$(grep '^CF_ACME_TOKEN=' '${work_dir}/cf.env' | cut -d'=' -f2-) CF_Zone_ID=\$(grep '^CF_ACME_ZONE_ID=' '${work_dir}/cf.env' | cut -d'=' -f2-) '${_acme_sh_bin}' --install-cert -d '${domain}' --home '${work_dir}/.acme.sh' --key-file '${cert_dir}/key.pem' --fullchain-file '${cert_dir}/cert.pem' --reloadcmd true >>'${work_dir}/acme.log' 2>&1"
+    (crontab -l 2>/dev/null; echo "17 4 * * * ${sync_cmd} ${marker}") | crontab -
 }
 
 # =========================================================
@@ -1523,10 +1544,13 @@ remove_protocol() {
         return 0
     fi
 
-    local port proto
+    local port proto acme_domain
     port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen_port' \
         "${conf_dir}/inbounds.json" 2>/dev/null)
     proto="${EXTRA_PROTO_TRANSPORT[$tag]:-tcp}"
+    # 必须在删除 inbound 之前读取 server_name，删除后就查不到了
+    acme_domain=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .tls.server_name' \
+        "${conf_dir}/inbounds.json" 2>/dev/null)
 
     _remove_inbound_json "$tag" || { red "删除 ${tag} 配置失败"; return 1; }
 
@@ -1535,7 +1559,9 @@ remove_protocol() {
     fi
 
     _mark_protocol_removed "$tag"
-    if [ -f "${work_dir}/protocols_acme.list" ]; then
+    local _removed_acme_domain=""
+    if [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$tag" "${work_dir}/protocols_acme.list"; then
+        _removed_acme_domain="$acme_domain"
         local _tmp
         _tmp=$(mktemp)
         if [ -n "$_tmp" ]; then
@@ -1543,6 +1569,16 @@ remove_protocol() {
             mv "$_tmp" "${work_dir}/protocols_acme.list"
         fi
     fi
+
+    # 若该域名不再被任何已装协议使用，清理对应的证书同步 cron 任务，避免残留垃圾任务
+    if [ -n "$_removed_acme_domain" ] && [ "$_removed_acme_domain" != "null" ]; then
+        if ! jq -e --arg d "$_removed_acme_domain" \
+            '.inbounds[] | select(.tls.server_name == $d)' \
+            "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
+            crontab -l 2>/dev/null | grep -vF "# sing-box-extra-protocols acme sync: ${_removed_acme_domain}" | crontab - 2>/dev/null
+        fi
+    fi
+
     green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除"
 }
 
@@ -1960,6 +1996,9 @@ _do_uninstall_core() {
         fi
     else
         rm -rf "$backup_dir" 2>/dev/null
+        # 彻底卸载（不保留配置）时才清理 acme 证书同步的 cron 任务；
+        # 保留配置场景下这些任务在重装恢复后仍需继续运行，不能清
+        crontab -l 2>/dev/null | grep -v "# sing-box-extra-protocols acme sync:" | crontab - 2>/dev/null
     fi
 
     systemctl stop    sing-box argo 2>/dev/null
