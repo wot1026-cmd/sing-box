@@ -478,6 +478,11 @@ EOF
         if [ -f "${backup_dir}/protocols.list" ]; then
             [ -f "${backup_dir}/reality.key" ]     && cp "${backup_dir}/reality.key" "${work_dir}/reality.key" && chmod 600 "${work_dir}/reality.key"
             [ -f "${backup_dir}/reality.shortid" ] && cp "${backup_dir}/reality.shortid" "${work_dir}/reality.shortid" && chmod 600 "${work_dir}/reality.shortid"
+            # acme.sh 签发的证书文件与其账号/续期状态目录，inbound 里的
+            # certificate_path/key_path 直接指向 acme/<domain>/ 下的文件，
+            # 不恢复这两个目录会导致恢复后的 acme 协议指向空证书、服务启动失败。
+            [ -d "${backup_dir}/acme" ]     && cp -r "${backup_dir}/acme" "${work_dir}/acme"
+            [ -d "${backup_dir}/.acme.sh" ] && cp -r "${backup_dir}/.acme.sh" "${work_dir}/.acme.sh"
 
             local _ep_tag _ep_inbound _ep_port _ep_proto _tmp_merge
             while IFS= read -r _ep_tag; do
@@ -525,6 +530,8 @@ setup_services() {
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 User=root
@@ -534,7 +541,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/etc/sing-box/sing-box run -C /etc/sing-box/conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-RestartSec=10
+RestartSec=15
 LimitNOFILE=infinity
 
 [Install]
@@ -1157,7 +1164,7 @@ _write_cf_env_key() {
 # 返回值：0 = 已配置 acme（供调用方读取 CF_ACME_TOKEN/CF_ACME_DOMAIN）
 #         1 = 用户选择跳过，使用自签证书
 ensure_acme_config() {
-    local token domain acme_choice
+    local token zone_id domain acme_choice
     token=$(_read_cf_env_key CF_ACME_TOKEN)
     domain=$(_read_cf_env_key CF_ACME_DOMAIN)
     if [ -n "$token" ] && [ -n "$domain" ]; then
@@ -1166,7 +1173,7 @@ ensure_acme_config() {
 
     echo ""
     purple "该协议需要 TLS 证书。可选择：\n"
-    skyblue "1. 使用 acme 自动申请真实证书（需域名 + Cloudflare API Token，DNS 记录须为“仅 DNS”不走代理）"
+    skyblue "1. 使用 acme 自动申请真实证书（需域名 + Cloudflare API Token/Zone ID，DNS 记录须为“仅 DNS”不走代理）"
     skyblue "2. 使用自签证书（客户端需 insecure=1 跳过验证，配置更快）"
     reading "请选择 (1/2，回车默认 2): " acme_choice
 
@@ -1188,16 +1195,103 @@ ensure_acme_config() {
         yellow "Token 为空，回退使用自签证书"
         return 1
     fi
+    echo ""
+    yellow "acme.sh 需要 Zone ID 才能定位到具体域名（Cloudflare 后台该域名的 Overview 页面右侧“API”栏可查看）"
+    reading "请输入 Cloudflare Zone ID: " zone_id
+    if [ -z "$zone_id" ]; then
+        yellow "Zone ID 为空，回退使用自签证书"
+        return 1
+    fi
 
     _write_cf_env_key CF_ACME_TOKEN "$token"
     _write_cf_env_key CF_ACME_DOMAIN "$domain"
+    _write_cf_env_key CF_ACME_ZONE_ID "$zone_id"
     green "acme 配置已保存（${work_dir}/cf.env，权限 600）"
     return 0
 }
 
 # =========================================================
+# acme.sh 证书申请：TUIC / AnyTLS 共用
+# 不使用 sing-box 内置 acme 客户端（其 DNS-01 传播检测在纯 IPv4 环境下
+# 会因写死的 IPv6 解析器而失败，参见 2026-08 DediRock 实测记录）。
+# 改用 acme.sh 独立申请证书后，以 certificate_path/key_path 形式接入 sing-box；
+# sing-box 官方文档确认证书文件在被修改时会自动重新加载，
+# 续期由 acme.sh 自带的 cron 任务处理，全程无需重启 sing-box。
+# =========================================================
+_acme_sh_bin="${HOME}/.acme.sh/acme.sh"
+
+_ensure_acme_sh_installed() {
+    if [ -x "$_acme_sh_bin" ]; then
+        return 0
+    fi
+    yellow "首次使用 acme.sh，正在安装…"
+    if ! curl -fsSL https://get.acme.sh | sh -s email="acme@$(hostname -f 2>/dev/null || echo local)" >/dev/null 2>&1; then
+        red "acme.sh 安装失败，请检查网络"
+        return 1
+    fi
+    if [ ! -x "$_acme_sh_bin" ]; then
+        red "acme.sh 安装后未找到可执行文件：${_acme_sh_bin}"
+        return 1
+    fi
+    green "acme.sh 安装完成"
+    return 0
+}
+
+# 为指定域名申请证书，成功后把证书/私钥安装到 ${work_dir}/acme/<domain>/{cert.pem,key.pem}
+# 供 inbound 的 certificate_path/key_path 直接引用。
+# 用法：_acme_sh_issue_cert <domain>
+_acme_sh_issue_cert() {
+    local domain="$1"
+    local token zone_id
+    token=$(_read_cf_env_key CF_ACME_TOKEN)
+    zone_id=$(_read_cf_env_key CF_ACME_ZONE_ID)
+    if [ -z "$token" ] || [ -z "$zone_id" ]; then
+        red "未找到 acme Cloudflare Token/Zone ID 配置"
+        return 1
+    fi
+
+    _ensure_acme_sh_installed || return 1
+
+    local cert_dir="${work_dir}/acme/${domain}"
+    mkdir -p "$cert_dir"
+
+    # 已有证书且未接近过期（acme.sh --issue 对已存在且未到期的证书会直接跳过重复申请，
+    # 幂等，可放心重复调用）
+    if CF_Token="$token" CF_Zone_ID="$zone_id" \
+        "$_acme_sh_bin" --issue --dns dns_cf -d "$domain" --server letsencrypt \
+        --home "${work_dir}/.acme.sh" >>"${work_dir}/acme.log" 2>&1; then
+        : # 申请成功或证书仍在有效期内被跳过，均视为成功
+    else
+        local ret=$?
+        # acme.sh 对"证书未到期无需续期"返回码为 2，不是失败
+        if [ "$ret" -ne 2 ]; then
+            red "acme.sh 证书申请失败，详情见 ${work_dir}/acme.log"
+            return 1
+        fi
+    fi
+
+    if ! CF_Token="$token" CF_Zone_ID="$zone_id" \
+        "$_acme_sh_bin" --install-cert -d "$domain" \
+        --home "${work_dir}/.acme.sh" \
+        --key-file "${cert_dir}/key.pem" \
+        --fullchain-file "${cert_dir}/cert.pem" \
+        --reloadcmd "true" >>"${work_dir}/acme.log" 2>&1; then
+        red "acme.sh 证书安装失败，详情见 ${work_dir}/acme.log"
+        return 1
+    fi
+
+    if [ ! -s "${cert_dir}/cert.pem" ] || [ ! -s "${cert_dir}/key.pem" ]; then
+        red "证书文件未正确生成：${cert_dir}"
+        return 1
+    fi
+
+    green "acme.sh 证书已就绪：${cert_dir}（自动续期由 acme.sh 自带 cron 处理）"
+    return 0
+}
+
+# =========================================================
 # add_protocol_tuic：生成 TUIC v5 inbound
-# 优先 acme 真实证书；否则回退复用现有自签 cert.pem / private.key
+# 优先 acme.sh 申请真实证书；否则回退复用现有自签 cert.pem / private.key
 # =========================================================
 add_protocol_tuic() {
     if is_protocol_installed tuic; then
@@ -1205,12 +1299,19 @@ add_protocol_tuic() {
         return 0
     fi
 
-    local use_acme=false acme_domain acme_token
+    local use_acme=false acme_domain
     if ensure_acme_config; then
-        use_acme=true
         acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
-        acme_token=$(_read_cf_env_key CF_ACME_TOKEN)
-    elif [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+        # 先在装 inbound 之前就把证书申请完，申请失败直接中止，
+        # 不会出现"配置已写入但 sing-box 启动时才发现证书拿不到"导致服务崩溃重启的情况
+        # （2026-08 DediRock 曾因此触发 Let's Encrypt 限流，参见脚本内相关记录）。
+        if _acme_sh_issue_cert "$acme_domain"; then
+            use_acme=true
+        else
+            yellow "acme 证书申请失败，回退使用自签证书"
+        fi
+    fi
+    if ! $use_acme && { [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; }; then
         red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
         return 1
     fi
@@ -1227,7 +1328,8 @@ add_protocol_tuic() {
             --arg uuid "$uuid" \
             --arg pass "$password" \
             --arg domain "$acme_domain" \
-            --arg token "$acme_token" \
+            --arg cert "${work_dir}/acme/${acme_domain}/cert.pem" \
+            --arg key  "${work_dir}/acme/${acme_domain}/key.pem" \
             '{
                 type: "tuic",
                 tag: "tuic",
@@ -1239,14 +1341,8 @@ add_protocol_tuic() {
                     enabled: true,
                     server_name: $domain,
                     alpn: ["h3"],
-                    acme: {
-                        domain: $domain,
-                        email: ("acme@" + $domain),
-                        dns01_challenge: {
-                            provider: "cloudflare",
-                            api_token: $token
-                        }
-                    }
+                    certificate_path: $cert,
+                    key_path: $key
                 }
             }')
     else
@@ -1346,12 +1442,17 @@ add_protocol_anytls() {
         return 0
     fi
 
-    local use_acme=false acme_domain acme_token
+    local use_acme=false acme_domain
     if ensure_acme_config; then
-        use_acme=true
         acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
-        acme_token=$(_read_cf_env_key CF_ACME_TOKEN)
-    elif [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; then
+        # 同 TUIC：先申请证书，成功了再生成 inbound，避免证书问题拖垮整个服务
+        if _acme_sh_issue_cert "$acme_domain"; then
+            use_acme=true
+        else
+            yellow "acme 证书申请失败，回退使用自签证书"
+        fi
+    fi
+    if ! $use_acme && { [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; }; then
         red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
         return 1
     fi
@@ -1366,7 +1467,8 @@ add_protocol_anytls() {
             --argjson port "$port" \
             --arg pass "$password" \
             --arg domain "$acme_domain" \
-            --arg token "$acme_token" \
+            --arg cert "${work_dir}/acme/${acme_domain}/cert.pem" \
+            --arg key  "${work_dir}/acme/${acme_domain}/key.pem" \
             '{
                 type: "anytls",
                 tag: "anytls",
@@ -1376,14 +1478,8 @@ add_protocol_anytls() {
                 tls: {
                     enabled: true,
                     server_name: $domain,
-                    acme: {
-                        domain: $domain,
-                        email: ("acme@" + $domain),
-                        dns01_challenge: {
-                            provider: "cloudflare",
-                            api_token: $token
-                        }
-                    }
+                    certificate_path: $cert,
+                    key_path: $key
                 }
             }')
     else
@@ -1849,6 +1945,8 @@ _do_uninstall_core() {
         [ -f "${work_dir}/argo_token" ]      && cp "${work_dir}/argo_token"      "${backup_dir}/argo_token"
         [ -f "${work_dir}/protocols.list" ]  && cp "${work_dir}/protocols.list"  "${backup_dir}/protocols.list"
         [ -f "${work_dir}/protocols_acme.list" ] && cp "${work_dir}/protocols_acme.list" "${backup_dir}/protocols_acme.list"
+        [ -d "${work_dir}/acme" ]      && cp -r "${work_dir}/acme"      "${backup_dir}/acme"
+        [ -d "${work_dir}/.acme.sh" ]  && cp -r "${work_dir}/.acme.sh"  "${backup_dir}/.acme.sh"
         [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
         [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
