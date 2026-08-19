@@ -483,6 +483,7 @@ EOF
             # 不恢复这两个目录会导致恢复后的 acme 协议指向空证书、服务启动失败。
             [ -d "${backup_dir}/acme" ]     && cp -r "${backup_dir}/acme" "${work_dir}/acme"
             [ -d "${backup_dir}/.acme.sh" ] && cp -r "${backup_dir}/.acme.sh" "${work_dir}/.acme.sh"
+            [ -d "${backup_dir}/protocol_creds" ] && cp -r "${backup_dir}/protocol_creds" "${work_dir}/protocol_creds"
 
             local _ep_tag _ep_inbound _ep_port _ep_proto _tmp_merge
             while IFS= read -r _ep_tag; do
@@ -1331,6 +1332,50 @@ _ensure_acme_sync_cron() {
 }
 
 # =========================================================
+# 协议凭证存档：删除协议时不清除，重新添加时可选择复用，
+# 避免每次删除+重装都要在客户端重新导入链接（UUID/密码/端口全变）。
+# 存档路径：${work_dir}/protocol_creds/<tag>.json
+# =========================================================
+_creds_dir="${work_dir}/protocol_creds"
+
+_ensure_creds_dir() {
+    mkdir -p "$_creds_dir"
+}
+
+# 用法：_save_protocol_creds <tag> <json字符串>
+_save_protocol_creds() {
+    local tag="$1" json="$2"
+    _ensure_creds_dir
+    echo "$json" > "${_creds_dir}/${tag}.json"
+    chmod 600 "${_creds_dir}/${tag}.json"
+}
+
+# 用法：_read_protocol_creds <tag>；无存档时输出为空，调用方需自行判断
+_read_protocol_creds() {
+    local tag="$1"
+    [ -s "${_creds_dir}/${tag}.json" ] && cat "${_creds_dir}/${tag}.json"
+}
+
+# 询问是否复用旧凭证；仅在存档存在时才会问，否则静默返回1（走新生成分支）
+# 返回 0 = 复用（调用方自行从 _read_protocol_creds 取值），1 = 重新生成
+_ask_reuse_creds() {
+    local tag="$1" proto_name="$2"
+    local old_json
+    old_json=$(_read_protocol_creds "$tag")
+    [ -z "$old_json" ] && return 1
+
+    echo ""
+    yellow "检测到 ${proto_name} 之前的配置（UUID/密码/端口），是否复用？"
+    yellow "复用可避免客户端重新导入链接；选择重新生成则视为全新节点。"
+    local reuse_choice
+    reading "是否复用旧配置？(Y/n，回车默认 Y): " reuse_choice
+    if [[ "$reuse_choice" =~ ^[nN]$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# =========================================================
 # add_protocol_tuic：生成 TUIC v5 inbound
 # 优先 acme.sh 申请真实证书；否则回退复用现有自签 cert.pem / private.key
 # =========================================================
@@ -1358,9 +1403,25 @@ add_protocol_tuic() {
     fi
 
     local port uuid password
-    port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
-    uuid=$(cat /proc/sys/kernel/random/uuid)
-    password=$(openssl rand -hex 16)
+    local reused=false
+    if _ask_reuse_creds tuic "TUIC v5"; then
+        local old_json
+        old_json=$(_read_protocol_creds tuic)
+        uuid=$(jq -r '.uuid' <<< "$old_json")
+        password=$(jq -r '.password' <<< "$old_json")
+        port=$(jq -r '.port' <<< "$old_json")
+        # 旧端口若已被占用（比如期间装了别的服务），自动换新端口，不阻塞流程
+        if ss -ulnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+            port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
+        fi
+        reused=true
+        green "已复用 TUIC 旧配置（UUID/密码不变，客户端链接可能仅端口变化）"
+    else
+        port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        password=$(openssl rand -hex 16)
+    fi
 
     local inbound
     if $use_acme; then
@@ -1412,6 +1473,8 @@ add_protocol_tuic() {
     _add_inbound_json "$inbound" || { red "写入 TUIC 配置失败"; return 1; }
     allow_port "${port}/udp"
     _mark_protocol_installed tuic
+    _save_protocol_creds tuic "$(jq -n --arg u "$uuid" --arg p "$password" --argjson port "$port" \
+        '{uuid: $u, password: $p, port: $port}')"
     if $use_acme; then
         echo "tuic" >> "${work_dir}/protocols_acme.list"
         green "TUIC v5 已添加，端口：${port}（acme 证书：${acme_domain}）"
@@ -1433,10 +1496,23 @@ add_protocol_reality() {
     _ensure_reality_shortid || return 1
 
     local port uuid sni
-    port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
-    uuid=$(cat /proc/sys/kernel/random/uuid)
     # www.microsoft.com 实测在部分客户端（v2rayN）握手失败，改用 apple.com（已实测多端可连）
     sni="www.apple.com"
+
+    if _ask_reuse_creds reality "VLESS-Reality"; then
+        local old_json
+        old_json=$(_read_protocol_creds reality)
+        uuid=$(jq -r '.uuid' <<< "$old_json")
+        port=$(jq -r '.port' <<< "$old_json")
+        if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+            port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+        fi
+        green "已复用 Reality 旧配置（UUID/密钥对不变，客户端链接可能仅端口变化）"
+    else
+        port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+    fi
 
     local priv short_id
     priv=$(_reality_private_key)
@@ -1470,6 +1546,8 @@ add_protocol_reality() {
     _add_inbound_json "$inbound" || { red "写入 Reality 配置失败"; return 1; }
     allow_port "${port}/tcp"
     _mark_protocol_installed reality
+    _save_protocol_creds reality "$(jq -n --arg u "$uuid" --argjson port "$port" \
+        '{uuid: $u, port: $port}')"
     green "VLESS-Reality 已添加，端口：${port}（直连，不走 Argo）"
 }
 
@@ -1499,8 +1577,20 @@ add_protocol_anytls() {
     fi
 
     local port password
-    port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
-    password=$(openssl rand -hex 16)
+    if _ask_reuse_creds anytls "AnyTLS"; then
+        local old_json
+        old_json=$(_read_protocol_creds anytls)
+        password=$(jq -r '.password' <<< "$old_json")
+        port=$(jq -r '.port' <<< "$old_json")
+        if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+            port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+        fi
+        green "已复用 AnyTLS 旧配置（密码不变，客户端链接可能仅端口变化）"
+    else
+        port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+        password=$(openssl rand -hex 16)
+    fi
 
     local inbound
     if $use_acme; then
@@ -1546,6 +1636,8 @@ add_protocol_anytls() {
     _add_inbound_json "$inbound" || { red "写入 AnyTLS 配置失败"; return 1; }
     allow_port "${port}/tcp"
     _mark_protocol_installed anytls
+    _save_protocol_creds anytls "$(jq -n --arg p "$password" --argjson port "$port" \
+        '{password: $p, port: $port}')"
     if $use_acme; then
         echo "anytls" >> "${work_dir}/protocols_acme.list"
         green "AnyTLS 已添加，端口：${port}（acme 证书：${acme_domain}）"
@@ -1603,7 +1695,7 @@ remove_protocol() {
         fi
     fi
 
-    green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除"
+    green "${EXTRA_PROTO_NAME[$tag]:-$tag} 已删除（UUID/密码/端口配置已保留，重新添加时可选择复用）"
 }
 
 # =========================================================
@@ -1672,6 +1764,9 @@ manage_extra_protocols() {
         echo ""
         green  "a. 增加协议"
         $any_installed && red "d. 删除协议"
+        local has_creds=false
+        [ -d "${work_dir}/protocol_creds" ] && [ -n "$(ls -A "${work_dir}/protocol_creds" 2>/dev/null)" ] && has_creds=true
+        $has_creds && yellow "c. 清除旧配置存档（清除后重新添加将不再提示复用）"
         purple "0. 返回主菜单"
         skyblue "------------"
         reading "请输入选择: " choice
@@ -1697,6 +1792,17 @@ manage_extra_protocols() {
                 done
                 restart_singbox
                 get_info
+                ;;
+            c|C)
+                if ! $has_creds; then
+                    yellow "当前没有可清除的存档"; sleep 1; continue
+                fi
+                reading "确定清除所有旧配置存档？此操作不可恢复 (y/N): " confirm_clear
+                if [[ "$confirm_clear" =~ ^[yY]$ ]]; then
+                    rm -rf "${work_dir}/protocol_creds"
+                    green "存档已清除"
+                fi
+                sleep 1
                 ;;
             0) return ;;
             *) red "无效选项"; sleep 1 ;;
@@ -2009,6 +2115,7 @@ _do_uninstall_core() {
         [ -d "${work_dir}/.acme.sh" ]  && cp -r "${work_dir}/.acme.sh"  "${backup_dir}/.acme.sh"
         [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
         [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
+        [ -d "${work_dir}/protocol_creds" ]  && cp -r "${work_dir}/protocol_creds" "${backup_dir}/protocol_creds"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
 
         if [ -s "${backup_dir}/inbounds.json" ] && [ -s "${backup_dir}/cert.pem" ]; then
