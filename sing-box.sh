@@ -1167,7 +1167,11 @@ ensure_acme_config() {
     local token zone_id domain acme_choice
     token=$(_read_cf_env_key CF_ACME_TOKEN)
     domain=$(_read_cf_env_key CF_ACME_DOMAIN)
-    if [ -n "$token" ] && [ -n "$domain" ]; then
+    zone_id=$(_read_cf_env_key CF_ACME_ZONE_ID)
+    # 三个字段必须同时存在才算已配置完整（历史遗留：旧版本脚本只存了
+    # token/domain 两个字段，没有 zone_id，若只判断前两者会误判为"已配置"，
+    # 导致后续 acme.sh 因缺 zone_id 直接申请失败，且不会再询问用户补齐）。
+    if [ -n "$token" ] && [ -n "$domain" ] && [ -n "$zone_id" ]; then
         return 0
     fi
 
