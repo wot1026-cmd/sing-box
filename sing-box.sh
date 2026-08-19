@@ -1298,20 +1298,36 @@ _acme_sh_issue_cert() {
     return 0
 }
 
-# 独立于 acme.sh 自带的 reloadcmd 机制，额外加一道保险：
-# 部分环境下 acme.sh 续期时不会按预期重新执行 install-cert（社区有相关反馈，
-# 行为不完全可靠），若证书续期了但未同步到 certificate_path 指向的文件，
-# sing-box 会一直用旧证书直到过期。此处每天定时主动重新执行一次 install-cert，
-# 把最新证书强制同步到目标路径，即使 reloadcmd 没触发也能兜底。
+# 独立于 acme.sh 自带的 reloadcmd 机制，额外加两道保险：
+#
+# 1) 真正的续期检查：acme.sh 安装脚本会自动生成一条系统级 --cron 任务，
+#    但它固定使用默认的 --home（如 /root/.acme.sh），与本脚本证书数据实际存放的
+#    自定义 --home（${work_dir}/.acme.sh）是两个不同目录，无法读到我们的账号/证书数据，
+#    实际上不会对这里申请的证书做任何续期检查（2026-08 DediRock 实测确认此现象）。
+#    此处额外注册一条指向正确 --home 的 --cron 任务，确保续期检查真正生效。
+#
+# 2) 证书同步：部分环境下 acme.sh 续期时不会按预期重新执行 install-cert（社区有相关反馈，
+#    行为不完全可靠），若证书续期了但未同步到 certificate_path 指向的文件，
+#    sing-box 会一直用旧证书直到过期。每天定时主动重新执行一次 install-cert，
+#    把最新证书强制同步到目标路径，即使 reloadcmd 没触发也能兜底。
 _ensure_acme_sync_cron() {
     local domain="$1"
-    local marker="# sing-box-extra-protocols acme sync: ${domain}"
-    if crontab -l 2>/dev/null | grep -qF "$marker"; then
+
+    # 1) 续期检查任务：整个 --home 目录级别只需注册一次，覆盖该目录下所有域名
+    local renew_marker="# sing-box-extra-protocols acme renew-check"
+    if ! crontab -l 2>/dev/null | grep -qF "$renew_marker"; then
+        local renew_cmd="'${_acme_sh_bin}' --cron --home '${work_dir}/.acme.sh' >>'${work_dir}/acme.log' 2>&1"
+        (crontab -l 2>/dev/null; echo "33 3 * * * ${renew_cmd} ${renew_marker}") | crontab -
+    fi
+
+    # 2) 证书同步任务：按域名单独注册（不同协议若共用同一域名，第二次调用会因 marker 已存在而跳过）
+    local sync_marker="# sing-box-extra-protocols acme sync: ${domain}"
+    if crontab -l 2>/dev/null | grep -qF "$sync_marker"; then
         return 0
     fi
     local cert_dir="${work_dir}/acme/${domain}"
     local sync_cmd="CF_Token=\$(grep '^CF_ACME_TOKEN=' '${work_dir}/cf.env' | cut -d'=' -f2-) CF_Zone_ID=\$(grep '^CF_ACME_ZONE_ID=' '${work_dir}/cf.env' | cut -d'=' -f2-) '${_acme_sh_bin}' --install-cert -d '${domain}' --home '${work_dir}/.acme.sh' --key-file '${cert_dir}/key.pem' --fullchain-file '${cert_dir}/cert.pem' --reloadcmd true >>'${work_dir}/acme.log' 2>&1"
-    (crontab -l 2>/dev/null; echo "17 4 * * * ${sync_cmd} ${marker}") | crontab -
+    (crontab -l 2>/dev/null; echo "17 4 * * * ${sync_cmd} ${sync_marker}") | crontab -
 }
 
 # =========================================================
@@ -1580,6 +1596,10 @@ remove_protocol() {
             '.inbounds[] | select(.tls.server_name == $d)' \
             "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
             crontab -l 2>/dev/null | grep -vF "# sing-box-extra-protocols acme sync: ${_removed_acme_domain}" | crontab - 2>/dev/null
+        fi
+        # 若已没有任何协议在使用 acme，续期检查任务也一并清理
+        if [ ! -s "${work_dir}/protocols_acme.list" ]; then
+            crontab -l 2>/dev/null | grep -vF "# sing-box-extra-protocols acme renew-check" | crontab - 2>/dev/null
         fi
     fi
 
@@ -2000,9 +2020,9 @@ _do_uninstall_core() {
         fi
     else
         rm -rf "$backup_dir" 2>/dev/null
-        # 彻底卸载（不保留配置）时才清理 acme 证书同步的 cron 任务；
+        # 彻底卸载（不保留配置）时才清理 acme 相关的 cron 任务（续期检查 + 证书同步）；
         # 保留配置场景下这些任务在重装恢复后仍需继续运行，不能清
-        crontab -l 2>/dev/null | grep -v "# sing-box-extra-protocols acme sync:" | crontab - 2>/dev/null
+        crontab -l 2>/dev/null | grep -v "# sing-box-extra-protocols acme" | crontab - 2>/dev/null
     fi
 
     systemctl stop    sing-box argo 2>/dev/null
