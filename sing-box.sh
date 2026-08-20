@@ -1000,6 +1000,9 @@ change_config() {
                     if [[ "$input" =~ : ]]; then
                         cfip="${input%%:*}"; cfport="${input##*:}"
                         [[ ! "$cfport" =~ ^[0-9]+$ ]] || (( cfport > 65535 )) && cfport="443"
+                        # 若用户输入类似 ":8080" 这种，冒号前为空，cfip 会被解析成空字符串，
+                        # 写入 CFIP= 空值会破坏 Argo 域名/IP 解析配置，此处兜底回退默认值
+                        [ -z "$cfip" ] && cfip="cloudflare-ech.com"
                     else
                         cfip="$input"; cfport="443"
                     fi
@@ -1154,10 +1157,16 @@ _write_cf_env_key() {
     local key="$1" val="$2"
     _ensure_protocols_list  # 顺带确保 work_dir 存在
     touch "${work_dir}/cf.env"
-    if grep -q "^${key}=" "${work_dir}/cf.env" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "${work_dir}/cf.env"
-    else
-        echo "${key}=${val}" >> "${work_dir}/cf.env"
+    # 不用 sed 做行内替换：Cloudflare Token 可能包含 & 或 | 等字符，
+    # & 在 sed 替换文本里代表"匹配到的整行"，| 又是这里 sed 用的分隔符，
+    # 两者都会导致写入损坏或静默失败（已实测验证）。改用 grep 过滤旧行 + 追加新行，
+    # 不依赖任何转义规则，任意字符的 Token 都能正确处理。
+    local tmp
+    tmp=$(mktemp)
+    if [ -n "$tmp" ]; then
+        grep -v "^${key}=" "${work_dir}/cf.env" > "$tmp" 2>/dev/null
+        echo "${key}=${val}" >> "$tmp"
+        mv "$tmp" "${work_dir}/cf.env"
     fi
     chmod 600 "${work_dir}/cf.env"
 }
