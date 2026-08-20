@@ -3,7 +3,7 @@
 # 自用 sing-box 安装脚本
 # 协议: vless-argo(固定隧道) + hysteria2
 # 平台: Ubuntu / Debian (systemd)
-# 最后更新时间: 2026.6.21
+# 最后更新时间: 2026.8.20
 # =========================
 
 export LANG=en_US.UTF-8
