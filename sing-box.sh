@@ -849,7 +849,7 @@ cn_block_manage() {
 # ── 修改节点配置 ──────────────────────────────────
 change_config() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
 
     local inbounds_file="${conf_dir}/inbounds.json"
     local sb_status
@@ -1014,8 +1014,8 @@ change_config() {
             green "\nCF 优选已更新为：${cfip}:${cfport}\n"
             ;;
 
-        0) return ;;
-        *) red "无效选项！" ;;
+        0) return 1 ;;
+        *) red "无效选项！"; return 1 ;;
     esac
 }
 # =========================================================
@@ -3104,7 +3104,13 @@ case "$1" in
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true  ;;
                 5)  get_info;           need_pause=true  ;;
-                6)  change_config;      need_pause=true  ;;
+                6)
+                    if change_config; then
+                        need_pause=true
+                    else
+                        need_pause=false
+                    fi
+                    ;;
                 7)  cn_block_manage;    need_pause=true  ;;
                 8)  upgrade_singbox;    need_pause=true  ;;
                 9)  update_script;      need_pause=false ;;
