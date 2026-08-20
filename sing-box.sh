@@ -768,7 +768,7 @@ check_nodes() {
 # ── 大陆拦截 ──────────────────────────────────────
 cn_block_manage() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
 
     local route_file="${conf_dir}/route.json"
     jq empty "$route_file" 2>/dev/null || { red "route.json 格式异常，请检查文件内容"; sleep 2; return 1; }
@@ -790,7 +790,7 @@ cn_block_manage() {
     case "$choice" in
         1)
             if $block_enabled; then
-                yellow "大陆拦截已开启，无需重复操作\n"; sleep 1; return
+                yellow "大陆拦截已开启，无需重复操作\n"; sleep 1; return 1
             fi
             local tmp_file
             tmp_file=$(mktemp)
@@ -814,7 +814,7 @@ cn_block_manage() {
               ] + .route.rules
             ' "$route_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return
+                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
             fi
             mv "$tmp_file" "$route_file"
             restart_singbox
@@ -822,7 +822,7 @@ cn_block_manage() {
             ;;
         2)
             if ! $block_enabled; then
-                yellow "大陆拦截未开启\n"; sleep 1; return
+                yellow "大陆拦截未开启\n"; sleep 1; return 1
             fi
             local tmp_file
             tmp_file=$(mktemp)
@@ -835,14 +835,14 @@ cn_block_manage() {
               del(.route.rule_set[] | select(.tag == "geosite-cn"))
             ' "$route_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return
+                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
             fi
             mv "$tmp_file" "$route_file"
             restart_singbox
             green "\n大陆域名拦截已关闭\n"
             ;;
-        0) return ;;
-        *) red "无效选项" ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 0 ;;
     esac
 }
 
@@ -871,7 +871,7 @@ change_config() {
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
             if [[ -n "$new_uuid" ]] && \
                ! [[ "$new_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                red "UUID 格式不合法"; sleep 1; return
+                red "UUID 格式不合法"; sleep 1; return 0
             fi
             local tmp_file
             tmp_file=$(mktemp)
@@ -881,7 +881,7 @@ change_config() {
                 (.inbounds[] | select(.tag=="vless-ws") | .transport.path) = $p
             ' "$inbounds_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置文件写入失败，请检查！"; sleep 2; return
+                rm -f "$tmp_file"; red "配置文件写入失败，请检查！"; sleep 2; return 0
             fi
             mv "$tmp_file" "$inbounds_file"
             restart_singbox && get_info
@@ -894,10 +894,10 @@ change_config() {
                 new_port=$(pick_free_udp_port)
             else
                 if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-                    red "端口无效（1-65535）"; sleep 1; return
+                    red "端口无效（1-65535）"; sleep 1; return 0
                 fi
                 if ss -ulnH | awk '{print $5}' | grep -q ":${new_port}$"; then
-                    red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return
+                    red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
                 fi
             fi
             local old_port
@@ -908,7 +908,7 @@ change_config() {
                 '(.inbounds[] | select(.type=="hysteria2") | .listen_port) = $p' \
                 "$inbounds_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return
+                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return 0
             fi
             mv "$tmp_file" "$inbounds_file"
             # 删旧端口规则（IPv4，精确删除避免误伤）
@@ -939,10 +939,10 @@ change_config() {
             reading "\n请输入新的 VLESS-Argo 端口（回车随机生成）: " new_port
             [ -z "$new_port" ] && new_port=$(pick_free_tcp_port)
             if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-                red "端口无效（1-65535）"; sleep 1; return
+                red "端口无效（1-65535）"; sleep 1; return 0
             fi
             if ss -tlnH | awk '{print $5}' | grep -q ":${new_port}$"; then
-                red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return
+                red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
             fi
 
             # Token 模式下，本地端口和 Cloudflare Dashboard 后端配置是分离的，
@@ -960,7 +960,7 @@ change_config() {
                 yellow "在改完 Dashboard 配置之前，VLESS 节点会连接失败\n"
                 reading "是否已确认要继续修改本地端口？(y/n): " confirm_token
                 if [[ "$confirm_token" != [yY] ]]; then
-                    purple "已取消端口修改\n"; sleep 1; return
+                    purple "已取消端口修改\n"; sleep 1; return 0
                 fi
             fi
 
@@ -970,7 +970,7 @@ change_config() {
                 '(.inbounds[] | select(.tag=="vless-ws") | .listen_port) = $p' \
                 "$inbounds_file" > "$tmp_file"
             if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return
+                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return 0
             fi
             mv "$tmp_file" "$inbounds_file"
 
@@ -1015,7 +1015,7 @@ change_config() {
             ;;
 
         0) return 1 ;;
-        *) red "无效选项！"; return 1 ;;
+        *) red "无效选项！"; return 0 ;;
     esac
 }
 # =========================================================
@@ -1767,7 +1767,7 @@ select_extra_protocols() {
 # =========================================================
 manage_extra_protocols() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 0; }
 
     while true; do
         clear; echo ""
@@ -1828,7 +1828,7 @@ manage_extra_protocols() {
                 fi
                 sleep 1
                 ;;
-            0) return ;;
+            0) return 1 ;;
             *) red "无效选项"; sleep 1 ;;
         esac
     done
@@ -1919,14 +1919,14 @@ append_extra_protocol_links() {
 # ── 升级 sing-box ─────────────────────────────────
 upgrade_singbox() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
 
     local arch_raw arch
     arch_raw=$(uname -m)
     case "$arch_raw" in
         x86_64|amd64)  arch='amd64' ;;
         aarch64|arm64) arch='arm64' ;;
-        *) red "不支持的架构: ${arch_raw}"; return 1 ;;
+        *) red "不支持的架构: ${arch_raw}"; return 0 ;;
     esac
 
     local current_ver
@@ -1946,15 +1946,18 @@ upgrade_singbox() {
 
     if [ "$current_ver" = "$latest_ver" ]; then
         green "已是最新版 ${latest_ver}，无需升级\n"
-        return
+        return 1
     fi
 
     reading "确认升级到 v${latest_ver}？(y/n): " confirm
-    [[ "$confirm" != [yY] ]] && { purple "已取消\n"; return; }
+    [[ "$confirm" != [yY] ]] && { purple "已取消\n"; return 1; }
 
     local tmp_dest
     tmp_dest=$(mktemp)
-    download_singbox "$arch" "$latest_ver" "$tmp_dest" || return 1
+    if ! download_singbox "$arch" "$latest_ver" "$tmp_dest"; then
+        red "下载失败，请检查网络"
+        return 0
+    fi
 
     stop_singbox
 
@@ -1974,6 +1977,7 @@ upgrade_singbox() {
         start_singbox
         red "已回滚到旧版本，请检查网络或稍后重试\n"
     fi
+    return 0
 }
 
 # ── 配置固定 Argo 隧道 ────────────────────────────
@@ -1984,14 +1988,14 @@ configure_fixed_tunnel() {
 
     local argo_domain argo_auth
     reading "\n请输入 Argo 域名: " argo_domain
-    [ -z "$argo_domain" ] && { red "域名不能为空"; return 1; }
+    [ -z "$argo_domain" ] && { red "域名不能为空"; return 0; }
 
     if ! [[ "$argo_domain" =~ ^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$ ]]; then
-        red "域名格式不合法"; return 1
+        red "域名格式不合法"; return 0
     fi
 
     reading "\n请输入 Argo 密钥（Token 或 JSON）: " argo_auth
-    [ -z "$argo_auth" ] && { red "密钥不能为空"; return 1; }
+    [ -z "$argo_auth" ] && { red "密钥不能为空"; return 0; }
 
     local current_argo_port
     current_argo_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .listen_port' "${conf_dir}/inbounds.json" 2>/dev/null)
@@ -2005,7 +2009,7 @@ configure_fixed_tunnel() {
         tunnel_id=$(echo "$argo_auth" \
             | jq -r '(.TunnelID // .tunnelID // .tunnel_id) // empty' 2>/dev/null)
 
-        [ -z "$tunnel_id" ] && { red "无法解析 TunnelID，请检查 JSON 格式"; return 1; }
+        [ -z "$tunnel_id" ] && { red "无法解析 TunnelID，请检查 JSON 格式"; return 0; }
 
         cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: ${tunnel_id}
@@ -2058,7 +2062,7 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     else
-        red "密钥格式不匹配（请确认是 JSON 凭据或有效 Token）"; return 1
+        red "密钥格式不匹配（请确认是 JSON 凭据或有效 Token）"; return 0
     fi
 
     systemctl daemon-reload
@@ -2066,6 +2070,7 @@ EOF
     sleep 2
     get_info
     green "\n固定隧道配置完成，域名：${argo_domain}\n"
+    return 0
 }
 
 # ── Argo 管理菜单 ─────────────────────────────────
@@ -2083,12 +2088,12 @@ manage_argo() {
     skyblue "————"
     reading "\n请输入选择: " choice
     case "$choice" in
-        1) start_argo ;;
-        2) stop_argo ;;
-        3) restart_argo ;;
+        1) start_argo;   return 0 ;;
+        2) stop_argo;    return 0 ;;
+        3) restart_argo; return 0 ;;
         4) configure_fixed_tunnel ;;
-        0) return ;;
-        *) red "无效选项！" ;;
+        0) return 1 ;;
+        *) red "无效选项！"; return 0 ;;
     esac
 }
 
@@ -2254,7 +2259,7 @@ manage_fail2ban() {
         reading "\n请输入选择: " choice
         case "$choice" in
             1)
-                install_packages fail2ban || { red "安装失败"; return; }
+                install_packages fail2ban || { red "安装失败"; return 0; }
 
                 local ssh_port
                 ssh_port=$(ss -tlnpH 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | head -1)
@@ -2277,11 +2282,11 @@ EOF
                 else
                     red "\nfail2ban 启动失败，请检查日志: journalctl -u fail2ban\n"
                 fi
+                return 0
                 ;;
-            0) return ;;
-            *) red "无效选项" ;;
+            0) return 1 ;;
+            *) red "无效选项"; return 0 ;;
         esac
-        return
     fi
 
     local f2b_status
@@ -2307,19 +2312,21 @@ EOF
     skyblue "————"
     reading "\n请输入选择: " choice
     case "$choice" in
-        1) systemctl start fail2ban   && green "已启动" ;;
-        2) systemctl stop fail2ban    && green "已停止" ;;
-        3) systemctl restart fail2ban && green "已重启" ;;
+        1) systemctl start fail2ban   && green "已启动"; return 0 ;;
+        2) systemctl stop fail2ban    && green "已停止"; return 0 ;;
+        3) systemctl restart fail2ban && green "已重启"; return 0 ;;
         4)
             echo ""
             fail2ban-client status sshd 2>/dev/null || yellow "暂无数据"
+            return 0
             ;;
         5)
             reading "请输入要解封的 IP: " unban_ip
-            [ -z "$unban_ip" ] && { red "IP 不能为空"; return; }
+            [ -z "$unban_ip" ] && { red "IP 不能为空"; return 0; }
             fail2ban-client set sshd unbanip "$unban_ip" \
                 && green "已解封 ${unban_ip}" \
                 || red "解封失败，请确认该 IP 是否在封禁列表中"
+            return 0
             ;;
         6)
             reading "确定要卸载 fail2ban 吗? (y/n): " confirm
@@ -2328,12 +2335,14 @@ EOF
                 systemctl disable fail2ban 2>/dev/null
                 apt-get remove -y fail2ban 2>/dev/null
                 green "fail2ban 已卸载"
+                return 0
             else
                 purple "已取消"
+                return 1
             fi
             ;;
-        0) return ;;
-        *) red "无效选项" ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 0 ;;
     esac
 }
 
@@ -2441,6 +2450,7 @@ EOF
     else
         red "\n配置已写入，但验证异常 (拥塞控制=${cc}, 队列=${qdisc}, 缓冲区=${rmem}，期望值=${buf})\n请检查是否有其他文件覆盖了此设置（可用「扫描冲突配置」查看）\n"
     fi
+    return 0
 }
 
 bbr_apply_menu() {
@@ -2461,13 +2471,13 @@ bbr_apply_menu() {
             reading "请输入带宽 (Mbps): " bw
             if ! [[ "$bw" =~ ^[0-9]+$ ]] || [ "$bw" -eq 0 ]; then
                 red "输入无效，请输入正整数"
-                return
+                return 0
             fi
             reading "请输入预估RTT毫秒 (不清楚直接回车，默认150ms): " rtt
             [ -z "$rtt" ] && rtt=150
             if ! [[ "$rtt" =~ ^[0-9]+$ ]] || [ "$rtt" -eq 0 ]; then
                 red "RTT 输入无效，请输入正整数"
-                return
+                return 0
             fi
             local bw_bps bdp_bytes buf_bytes mem_cap
             bw_bps=$((bw * 1000000))
@@ -2485,15 +2495,15 @@ bbr_apply_menu() {
             yellow "\nBDP ≈ $((bdp_bytes / 1024 / 1024))MB，取2倍余量，最终缓冲区上限 = $((buf_bytes / 1024 / 1024))MB\n"
             bbr_write_conf "$buf_bytes" "自定义 (${bw}Mbps / ${rtt}ms RTT)" "$rtt"
             ;;
-        0) return ;;
-        *) red "无效选项" ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 0 ;;
     esac
 }
 
 bbr_disable() {
     if [ ! -f "$BBR_CONF" ]; then
         yellow "\n未检测到本脚本生成的调优配置，无需关闭\n"
-        return
+        return 0
     fi
     reading "确定要关闭本脚本的调优配置吗? 将恢复系统默认值 (y/n): " confirm
     if [[ "$confirm" == [yY] ]]; then
@@ -2505,6 +2515,7 @@ bbr_disable() {
     else
         purple "已取消"
     fi
+    return 0
 }
 
 bbr_scan() {
@@ -2516,7 +2527,7 @@ bbr_scan() {
     files=$(grep -rlE "$BBR_KEYWORDS" /etc/sysctl.d/ /etc/sysctl.conf /usr/lib/sysctl.d/ 2>/dev/null)
     if [ -z "$files" ]; then
         yellow "未发现相关配置文件。"
-        return
+        return 0
     fi
 
     local idx=0
@@ -2548,12 +2559,13 @@ bbr_scan() {
         done <<< "$dups"
     fi
     green "\n扫描完成。如需清理，请使用菜单中的「清理冲突配置」选项。\n"
+    return 0
 }
 
 bbr_clean() {
     bbr_scan
     if [ -z "${BBR_SCAN_FILES[*]}" ]; then
-        return
+        return 0
     fi
 
     echo ""
@@ -2561,7 +2573,7 @@ bbr_clean() {
     yellow "本功能不会整份删除文件，只会帮你注释掉扫描到的冲突网络参数那一行，其余内容保持不变。\n"
 
     reading "请输入要处理的编号 (空格分隔，如 \"1 2\"，或输入 0 取消): " nums
-    [ -z "$nums" ] || [ "$nums" = "0" ] && { purple "已取消"; return; }
+    [ -z "$nums" ] || [ "$nums" = "0" ] && { purple "已取消"; return 0; }
 
     for n in $nums; do
         local target="${BBR_SCAN_FILES[$n]}"
@@ -2591,6 +2603,7 @@ bbr_clean() {
     green "===== 处理后验证 ====="
     sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max 2>/dev/null
     yellow "\n如发现异常，可用对应的 .bak.时间戳 文件手动恢复。\n"
+    return 0
 }
 # ── DNS 管理 ──────────────────────────────────
 dns_get_mode() {
@@ -2658,19 +2671,20 @@ dns_menu() {
     skyblue "————"
     reading "\n请输入选择: " choice
     case "$choice" in
-        1) dns_apply "8.8.8.8" "8.8.4.4" ;;
-        2) dns_apply "1.1.1.1" "1.0.0.1" ;;
+        1) dns_apply "8.8.8.8" "8.8.4.4"; return 0 ;;
+        2) dns_apply "1.1.1.1" "1.0.0.1"; return 0 ;;
         3)
             reading "请输入主DNS: " d1
             reading "请输入备用DNS: " d2
             if [[ ! "$d1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$d2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 red "IP格式不正确"
-                return
+                return 0
             fi
             dns_apply "$d1" "$d2"
+            return 0
             ;;
-        0) return ;;
-        *) red "无效选项" ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 0 ;;
     esac
 }
 
@@ -2691,8 +2705,8 @@ bbr_tune_menu() {
         2) bbr_disable ;;
         3) bbr_scan ;;
         4) bbr_clean ;;
-        0) return ;;
-        *) red "无效选项" ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 0 ;;
     esac
 }
 
@@ -3108,27 +3122,37 @@ case "$1" in
                     ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
-                4)  manage_argo;        need_pause=true  ;;
+                4)
+                    if manage_argo; then need_pause=true; else need_pause=false; fi
+                    ;;
                 5)  get_info;           need_pause=true  ;;
                 6)
-                    if change_config; then
-                        need_pause=true
-                    else
-                        need_pause=false
-                    fi
+                    if change_config; then need_pause=true; else need_pause=false; fi
                     ;;
-                7)  cn_block_manage;    need_pause=true  ;;
-                8)  upgrade_singbox;    need_pause=true  ;;
+                7)
+                    if cn_block_manage; then need_pause=true; else need_pause=false; fi
+                    ;;
+                8)
+                    if upgrade_singbox; then need_pause=true; else need_pause=false; fi
+                    ;;
                 9)  update_script;      need_pause=false ;;
                 10)
                     clear
                     bash <(curl -fsSL https://ssh_tool.eooce.com)
                     need_pause=false
                     ;;
-                11) manage_fail2ban;        need_pause=true ;;
-                12) bbr_tune_menu;          need_pause=true ;;
-                13) dns_menu;               need_pause=true ;;
-                14) manage_extra_protocols; need_pause=true ;;
+                11)
+                    if manage_fail2ban; then need_pause=true; else need_pause=false; fi
+                    ;;
+                12)
+                    if bbr_tune_menu; then need_pause=true; else need_pause=false; fi
+                    ;;
+                13)
+                    if dns_menu; then need_pause=true; else need_pause=false; fi
+                    ;;
+                14)
+                    if manage_extra_protocols; then need_pause=true; else need_pause=false; fi
+                    ;;
                 0) exit 0 ;;
                 *) red "无效选项，请输入 0-14" ;;
             esac
