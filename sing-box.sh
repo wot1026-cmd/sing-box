@@ -567,7 +567,12 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable sing-box && systemctl start sing-box
+    systemctl enable sing-box
+    if ! systemctl start sing-box; then
+        red "\n⚠ sing-box 服务启动命令执行失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+    elif ! systemctl is-active sing-box &>/dev/null; then
+        red "\n⚠ sing-box 服务未能进入运行状态，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+    fi
     systemctl enable argo
 
     TUNNEL_FULLY_RESTORED=false
@@ -652,18 +657,36 @@ manage_service() {
             yellow "正在启动 ${name}…"
             systemctl daemon-reload
             systemctl start "$name"
-            systemctl is-active "$name" &>/dev/null && green "${name} 已启动" || red "${name} 启动失败"
+            if systemctl is-active "$name" &>/dev/null; then
+                green "${name} 已启动"
+                return 0
+            else
+                red "${name} 启动失败"
+                return 1
+            fi
             ;;
         stop)
             yellow "正在停止 ${name}…"
             systemctl stop "$name"
-            ! systemctl is-active "$name" &>/dev/null && green "${name} 已停止" || red "${name} 停止失败"
+            if ! systemctl is-active "$name" &>/dev/null; then
+                green "${name} 已停止"
+                return 0
+            else
+                red "${name} 停止失败"
+                return 1
+            fi
             ;;
         restart)
             yellow "正在重启 ${name}…"
             systemctl daemon-reload
             systemctl restart "$name"
-            systemctl is-active "$name" &>/dev/null && green "${name} 已重启" || red "${name} 重启失败"
+            if systemctl is-active "$name" &>/dev/null; then
+                green "${name} 已重启"
+                return 0
+            else
+                red "${name} 重启失败"
+                return 1
+            fi
             ;;
     esac
 }
@@ -817,8 +840,12 @@ cn_block_manage() {
                 rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
             fi
             mv "$tmp_file" "$route_file"
-            restart_singbox
-            green "\n大陆域名拦截已开启\n"
+            if restart_singbox; then
+                green "\n大陆域名拦截已开启\n"
+            else
+                red "\n路由规则已写入，但 sing-box 重启失败，拦截可能未生效"
+                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
             ;;
         2)
             if ! $block_enabled; then
@@ -838,8 +865,11 @@ cn_block_manage() {
                 rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
             fi
             mv "$tmp_file" "$route_file"
-            restart_singbox
-            green "\n大陆域名拦截已关闭\n"
+            if restart_singbox; then
+                green "\n大陆域名拦截已关闭\n"
+            else
+                red "\n路由规则已写入，但 sing-box 重启失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
             ;;
         0) return 1 ;;
         *) red "无效选项"; return 0 ;;
@@ -884,8 +914,13 @@ change_config() {
                 rm -f "$tmp_file"; red "配置文件写入失败，请检查！"; sleep 2; return 0
             fi
             mv "$tmp_file" "$inbounds_file"
-            restart_singbox && get_info
-            green "\nUUID 已修改为：${new_uuid}\n"
+            if restart_singbox; then
+                get_info
+                green "\nUUID 已修改为：${new_uuid}\n"
+            else
+                red "\n配置文件中的 UUID 已更新为 ${new_uuid}，但 sing-box 重启失败，节点当前不可用"
+                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
             ;;
 
        2)
@@ -932,8 +967,13 @@ change_config() {
                 yellow "保存 rules.v4 失败"
             fi
 
-            restart_singbox && get_info
-            green "\nHysteria2 端口已修改为：${new_port}\n"
+            if restart_singbox; then
+                get_info
+                green "\nHysteria2 端口已修改为：${new_port}\n"
+            else
+                red "\n端口已更新为 ${new_port}，但 sing-box 重启失败，节点当前不可用"
+                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
             ;;
         3)
             reading "\n请输入新的 VLESS-Argo 端口（回车随机生成）: " new_port
@@ -982,8 +1022,18 @@ change_config() {
                         "${work_dir}/tunnel.yml"
                 fi
             fi
-            restart_singbox && restart_argo && get_info
-            green "\nVLESS-Argo 端口已修改为：${new_port}\n"
+            if restart_singbox; then
+                if restart_argo; then
+                    get_info
+                    green "\nVLESS-Argo 端口已修改为：${new_port}\n"
+                else
+                    red "\n端口已更新为 ${new_port}，sing-box 已重启，但 argo 隧道重启失败，节点当前不可用"
+                    red "请检查：journalctl -u argo -n 50 --no-pager\n"
+                fi
+            else
+                red "\n端口已更新为 ${new_port}，但 sing-box 重启失败，节点当前不可用"
+                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
             ;;
 
         4)
@@ -1814,8 +1864,11 @@ manage_extra_protocols() {
                     dtag="${EXTRA_PROTO_ORDER[$idx]}"
                     remove_protocol "$dtag"
                 done
-                restart_singbox
-                get_info
+                if restart_singbox; then
+                    get_info
+                else
+                    red "\n协议已删除，但 sing-box 重启失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                fi
                 ;;
             c|C)
                 if ! $has_creds; then
@@ -1967,15 +2020,27 @@ upgrade_singbox() {
        chmod +x "${work_dir}/sing-box" && \
        chown root:root "${work_dir}/sing-box" && \
        "${work_dir}/sing-box" version &>/dev/null; then
-        rm -f "${work_dir}/sing-box.bak"
-        start_singbox
-        green "\nsing-box 已升级至 v${latest_ver}\n"
-        "${work_dir}/sing-box" version
+        if start_singbox; then
+            rm -f "${work_dir}/sing-box.bak"
+            green "\nsing-box 已升级至 v${latest_ver}\n"
+            "${work_dir}/sing-box" version
+        else
+            red "\n新版本二进制已就位，但服务启动失败，正在自动回滚到升级前版本…"
+            mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box"
+            if start_singbox; then
+                red "已自动回滚到旧版本，新版本可能与当前配置不兼容，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            else
+                red "回滚后服务仍无法启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+            fi
+        fi
     else
         red "升级失败，正在回滚…"
         mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box"
-        start_singbox
-        red "已回滚到旧版本，请检查网络或稍后重试\n"
+        if start_singbox; then
+            red "已回滚到旧版本，请检查网络或稍后重试\n"
+        else
+            red "回滚后服务仍无法启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+        fi
     fi
     return 0
 }
@@ -3050,8 +3115,11 @@ do_install() {
     ' "$route_file" > "$tmp_file"
     if [ $? -eq 0 ] && [ -s "$tmp_file" ] && jq empty "$tmp_file" 2>/dev/null; then
         mv "$tmp_file" "$route_file"
-        restart_singbox
-        green "大陆域名拦截已默认开启"
+        if restart_singbox; then
+            green "大陆域名拦截已默认开启"
+        else
+            yellow "大陆域名拦截规则已写入，但 sing-box 重启失败，可能未生效（不影响后续流程，可稍后手动检查）"
+        fi
     else
         rm -f "$tmp_file"
         yellow "大陆域名拦截配置失败，已跳过（不影响核心功能）"
