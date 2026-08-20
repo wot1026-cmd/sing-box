@@ -3,7 +3,7 @@
 # 自用 sing-box 安装脚本
 # 协议: vless-argo(固定隧道) + hysteria2
 # 平台: Ubuntu / Debian (systemd)
-# 最后更新时间: 2026.8.20
+# 最后更新时间: 2026.6.21
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1163,10 +1163,16 @@ _write_cf_env_key() {
     # 不依赖任何转义规则，任意字符的 Token 都能正确处理。
     local tmp
     tmp=$(mktemp)
-    if [ -n "$tmp" ]; then
-        grep -v "^${key}=" "${work_dir}/cf.env" > "$tmp" 2>/dev/null
-        echo "${key}=${val}" >> "$tmp"
-        mv "$tmp" "${work_dir}/cf.env"
+    if [ -z "$tmp" ]; then
+        red "临时文件创建失败（如 /tmp 空间不足），${key} 未写入"
+        return 1
+    fi
+    grep -v "^${key}=" "${work_dir}/cf.env" > "$tmp" 2>/dev/null
+    echo "${key}=${val}" >> "$tmp"
+    if ! mv "$tmp" "${work_dir}/cf.env"; then
+        red "写入 ${work_dir}/cf.env 失败，${key} 未生效"
+        rm -f "$tmp"
+        return 1
     fi
     chmod 600 "${work_dir}/cf.env"
 }
@@ -1217,9 +1223,12 @@ ensure_acme_config() {
         return 1
     fi
 
-    _write_cf_env_key CF_ACME_TOKEN "$token"
-    _write_cf_env_key CF_ACME_DOMAIN "$domain"
-    _write_cf_env_key CF_ACME_ZONE_ID "$zone_id"
+    if ! _write_cf_env_key CF_ACME_TOKEN "$token" || \
+       ! _write_cf_env_key CF_ACME_DOMAIN "$domain" || \
+       ! _write_cf_env_key CF_ACME_ZONE_ID "$zone_id"; then
+        red "acme 配置写入失败，回退使用自签证书"
+        return 1
+    fi
     green "acme 配置已保存（${work_dir}/cf.env，权限 600）"
     return 0
 }
