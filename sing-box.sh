@@ -1721,7 +1721,7 @@ remove_protocol() {
 # =========================================================
 select_extra_protocols() {
     clear; echo ""
-    purple "=== 选择要添加的备用协议（可多选，空格分隔，回车跳过）===\n"
+    purple "=== 选择要添加的备用协议（可多选，直接连写数字，如 13 表示装 TUIC 和 AnyTLS，回车跳过）===\n"
     local i=1 tag
     for tag in "${EXTRA_PROTO_ORDER[@]}"; do
         if is_protocol_installed "$tag"; then
@@ -1732,13 +1732,16 @@ select_extra_protocols() {
         (( i++ ))
     done
     echo ""
-    reading "请输入序号（如: 1 3 表示装 TUIC 和 AnyTLS）: " choices
+    reading "请输入序号: " choices
 
     [ -z "$choices" ] && { purple "已跳过\n"; return 0; }
 
-    local c idx
-    for c in $choices; do
-        if ! [[ "$c" =~ ^[0-9]+$ ]]; then
+    # 协议数量固定为个位数，序号直接连写即可（如 "13"），仍兼容空格分隔（如 "1 3"）
+    local compact="${choices// /}"
+    local c idx j
+    for (( j=0; j<${#compact}; j++ )); do
+        c="${compact:$j:1}"
+        if ! [[ "$c" =~ ^[0-9]$ ]]; then
             yellow "忽略无效输入：${c}"
             continue
         fi
@@ -1798,11 +1801,14 @@ manage_extra_protocols() {
                 if ! $any_installed; then
                     yellow "当前没有已安装的备用协议"; sleep 1; continue
                 fi
-                reading "请输入要删除的序号（空格分隔多个，回车取消）: " del_choices
+                reading "请输入要删除的序号（直接连写数字，如 13，回车取消）: " del_choices
                 [ -z "$del_choices" ] && continue
-                local c idx dtag
-                for c in $del_choices; do
-                    [[ "$c" =~ ^[0-9]+$ ]] || continue
+                # 协议数量固定为个位数，序号直接连写即可，仍兼容空格分隔
+                local del_compact="${del_choices// /}"
+                local c idx dtag j
+                for (( j=0; j<${#del_compact}; j++ )); do
+                    c="${del_compact:$j:1}"
+                    [[ "$c" =~ ^[0-9]$ ]] || continue
                     idx=$((c - 1))
                     [ "$idx" -lt 0 ] || [ "$idx" -ge "${#EXTRA_PROTO_ORDER[@]}" ] && continue
                     dtag="${EXTRA_PROTO_ORDER[$idx]}"
