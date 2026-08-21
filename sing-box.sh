@@ -3,7 +3,7 @@
 # 自用 sing-box 安装脚本
 # 协议: vless-argo(固定隧道) + hysteria2
 # 平台: Ubuntu / Debian (systemd)
-# 最后更新时间: 2026.6.21
+# 最后更新时间: 2026.8.21
 # =========================
 
 export LANG=en_US.UTF-8
@@ -567,7 +567,9 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable sing-box
+    if ! systemctl enable sing-box; then
+        yellow "\n⚠ sing-box 设置开机自启失败，重启 VPS 后可能不会自动拉起服务，请检查：systemctl status sing-box\n"
+    fi
     local sb_start_ok=true
     if ! systemctl start sing-box; then
         red "\n⚠ sing-box 服务启动命令执行失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
@@ -576,7 +578,9 @@ EOF
         red "\n⚠ sing-box 服务未能进入运行状态，请检查：journalctl -u sing-box -n 50 --no-pager\n"
         sb_start_ok=false
     fi
-    systemctl enable argo
+    if ! systemctl enable argo; then
+        yellow "\n⚠ argo 设置开机自启失败，重启 VPS 后可能不会自动拉起隧道，请检查：systemctl status argo\n"
+    fi
 
     TUNNEL_FULLY_RESTORED=false
 
@@ -2208,7 +2212,12 @@ _do_uninstall_core() {
         yellow "正在备份节点配置以便重装时恢复…"
         mkdir -p "$backup_dir"
         chmod 700 "$backup_dir"
-        rm -f "${backup_dir}"/* 2>/dev/null
+        # rm -f "${backup_dir}"/* 对目录会直接报错跳过（"Is a directory"），
+        # 且 * 通配符默认不匹配隐藏文件，acme/、.acme.sh/、protocol_creds/ 这几个目录
+        # 都会被漏掉、残留旧内容，导致重复"卸载保留配置"时新旧数据混杂
+        # （已实测验证：单纯换成 rm -rf 依然会漏掉 .acme.sh 这种隐藏目录）。
+        # 用 find 逐项清空，能正确处理隐藏文件和子目录。
+        find "$backup_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
 
         [ -f "${conf_dir}/inbounds.json" ]  && cp "${conf_dir}/inbounds.json"  "${backup_dir}/inbounds.json"
         [ -f "${work_dir}/cert.pem" ]        && cp "${work_dir}/cert.pem"        "${backup_dir}/cert.pem"
