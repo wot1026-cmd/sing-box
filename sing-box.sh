@@ -797,7 +797,7 @@ check_nodes() {
 # ── 大陆拦截 ──────────────────────────────────────
 cn_block_manage() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 0; }
 
     local route_file="${conf_dir}/route.json"
     jq empty "$route_file" 2>/dev/null || { red "route.json 格式异常，请检查文件内容"; sleep 2; return 1; }
@@ -885,7 +885,7 @@ cn_block_manage() {
 # ── 修改节点配置 ──────────────────────────────────
 change_config() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 0; }
 
     local inbounds_file="${conf_dir}/inbounds.json"
     local sb_status
@@ -1978,7 +1978,7 @@ append_extra_protocol_links() {
 # ── 升级 sing-box ─────────────────────────────────
 upgrade_singbox() {
     check_singbox &>/dev/null
-    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 1; }
+    [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 0; }
 
     local arch_raw arch
     arch_raw=$(uname -m)
@@ -2005,11 +2005,11 @@ upgrade_singbox() {
 
     if [ "$current_ver" = "$latest_ver" ]; then
         green "已是最新版 ${latest_ver}，无需升级\n"
-        return 1
+        return 0
     fi
 
     reading "确认升级到 v${latest_ver}？(y/n): " confirm
-    [[ "$confirm" != [yY] ]] && { purple "已取消\n"; return 1; }
+    [[ "$confirm" != [yY] ]] && { purple "已取消\n"; return 0; }
 
     local tmp_dest
     tmp_dest=$(mktemp)
@@ -2018,7 +2018,10 @@ upgrade_singbox() {
         return 0
     fi
 
-    stop_singbox
+    if ! stop_singbox; then
+        red "sing-box 停止失败，已取消升级（服务可能处于异常状态，请先检查：journalctl -u sing-box -n 50 --no-pager）"
+        return 0
+    fi
 
     cp "${work_dir}/sing-box" "${work_dir}/sing-box.bak"
 
@@ -2141,11 +2144,12 @@ EOF
         sleep 2
         get_info
         green "\n固定隧道配置完成，域名：${argo_domain}\n"
+        return 0
     else
         red "\n隧道配置已写入，但 argo 服务重启失败，节点当前不可用"
         red "请检查：journalctl -u argo -n 50 --no-pager\n"
+        return 1
     fi
-    return 0
 }
 
 # ── Argo 管理菜单 ─────────────────────────────────
@@ -2166,7 +2170,7 @@ manage_argo() {
         1) start_argo;   return 0 ;;
         2) stop_argo;    return 0 ;;
         3) restart_argo; return 0 ;;
-        4) configure_fixed_tunnel ;;
+        4) configure_fixed_tunnel; return 0 ;;
         0) return 1 ;;
         *) red "无效选项！"; return 0 ;;
     esac
