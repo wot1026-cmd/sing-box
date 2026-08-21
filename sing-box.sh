@@ -333,17 +333,29 @@ install_singbox() {
     allow_port "${hy2_port}/udp"
 
     # ── 证书：优先从备份恢复，保持 pinSHA256 不变 ─
+    # 除了校验 cert.pem 本身格式合法，还要确认 private.key 与其配对
+    # （公钥指纹一致），避免不同批次的证书/私钥被误恢复，导致
+    # hy2/tuic/anytls 全部握手失败且难以排查
     local cert_restored=false
     if $restore_backup \
        && [ -f "${backup_dir}/cert.pem" ] \
        && [ -f "${backup_dir}/private.key" ] \
        && openssl x509 -noout -in "${backup_dir}/cert.pem" 2>/dev/null; then
-        cp "${backup_dir}/cert.pem"    "${work_dir}/cert.pem"
-        cp "${backup_dir}/private.key" "${work_dir}/private.key"
-        chmod 600 "${work_dir}/private.key"
-        green "已从备份恢复 TLS 证书（pinSHA256 不变）"
-        cert_restored=true
-    else
+        local _cert_pub _key_pub
+        _cert_pub=$(openssl x509 -noout -pubkey -in "${backup_dir}/cert.pem" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        _key_pub=$(openssl pkey -pubout -in "${backup_dir}/private.key" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        if [ -n "$_cert_pub" ] && [ "$_cert_pub" = "$_key_pub" ]; then
+            cp "${backup_dir}/cert.pem"    "${work_dir}/cert.pem"
+            cp "${backup_dir}/private.key" "${work_dir}/private.key"
+            chmod 600 "${work_dir}/private.key"
+            green "已从备份恢复 TLS 证书（pinSHA256 不变）"
+            cert_restored=true
+        else
+            yellow "备份证书与私钥不配对，改为生成新证书"
+        fi
+    fi
+
+    if ! $cert_restored; then
         yellow "正在生成新 TLS 证书..."
         openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" 2>/dev/null
         openssl req -new -x509 -days 3650 \
@@ -734,7 +746,9 @@ is_fixed_tunnel_configured() { [ -f "${work_dir}/tunnel.yml" ]; }
 get_info() {
     yellow "\nIP 检测中，请稍候…\n"
     local server_ip node_prefix
-    server_ip=$(curl -4 -sm3 ip.sb)
+    server_ip=$(curl -4 -sm3 ip.sb 2>/dev/null)
+    [ -z "$server_ip" ] && server_ip=$(curl -4 -sm3 api.ipify.org 2>/dev/null)
+    [ -z "$server_ip" ] && server_ip=$(curl -4 -sm3 ifconfig.me 2>/dev/null)
     [ -z "$server_ip" ] && { red "获取 IP 失败"; return 1; }
     node_prefix=$(get_node_name)
 
@@ -3273,7 +3287,15 @@ case "$1" in
         do_install
         ;;
     -u|--uninstall)
-        yellow "正在无交互卸载 sing-box…\n"
+        if [[ "$2" == "-y" || "$2" == "--yes" ]]; then
+            yellow "正在无交互卸载 sing-box…\n"
+        else
+            reading "即将彻底卸载 sing-box（不保留配置备份），确认继续？(y/N): " _uninstall_confirm
+            if [[ "$_uninstall_confirm" != [yY] ]]; then
+                yellow "已取消卸载"
+                exit 0
+            fi
+        fi
         _do_uninstall_core false
         green "\nsing-box 卸载完成\n"
         ;;
@@ -3283,11 +3305,12 @@ case "$1" in
     -h|--help)
         echo ""
         green "用法: sb [参数]"
-        green "  -i, --install    安装"
-        green "  -u, --uninstall  卸载"
-        green "  -c, --check      查看节点"
-        green "  -h, --help       帮助"
-        green "  （无参数）       交互菜单"
+        green "  -i, --install         安装"
+        green "  -u, --uninstall       卸载（会二次确认）"
+        green "  -u, --uninstall -y    卸载（跳过确认，供脚本调用）"
+        green "  -c, --check           查看节点"
+        green "  -h, --help            帮助"
+        green "  （无参数）            交互菜单"
         echo ""
         ;;
     "")
