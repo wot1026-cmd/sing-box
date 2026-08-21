@@ -568,10 +568,13 @@ EOF
 
     systemctl daemon-reload
     systemctl enable sing-box
+    local sb_start_ok=true
     if ! systemctl start sing-box; then
         red "\n⚠ sing-box 服务启动命令执行失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+        sb_start_ok=false
     elif ! systemctl is-active sing-box &>/dev/null; then
         red "\n⚠ sing-box 服务未能进入运行状态，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+        sb_start_ok=false
     fi
     systemctl enable argo
 
@@ -583,6 +586,9 @@ EOF
             systemctl restart argo
         fi
     fi
+
+    $sb_start_ok && return 0
+    return 1
 }
 
 # ── 根据 tunnel.yml 重建 argo.service（用于恢复备份场景）──
@@ -2131,10 +2137,14 @@ EOF
     fi
 
     systemctl daemon-reload
-    restart_argo
-    sleep 2
-    get_info
-    green "\n固定隧道配置完成，域名：${argo_domain}\n"
+    if restart_argo; then
+        sleep 2
+        get_info
+        green "\n固定隧道配置完成，域名：${argo_domain}\n"
+    else
+        red "\n隧道配置已写入，但 argo 服务重启失败，节点当前不可用"
+        red "请检查：journalctl -u argo -n 50 --no-pager\n"
+    fi
     return 0
 }
 
@@ -3078,7 +3088,14 @@ do_install() {
     fi
 
     install_singbox "$install_ver"
-    setup_services
+    if setup_services; then
+        local sb_setup_ok=true
+    else
+        local sb_setup_ok=false
+        red "\n⚠ sing-box 核心服务未能正常启动，装机流程仍会继续完成配置文件生成，"
+        red "但节点当前不可用，请先排查：journalctl -u sing-box -n 50 --no-pager\n"
+        sleep 3
+    fi
     sleep 2
     create_shortcut
 
@@ -3125,7 +3142,12 @@ do_install() {
         yellow "大陆域名拦截配置失败，已跳过（不影响核心功能）"
     fi
     setup_firewall_base
-    green "\nsing-box 安装完成！"
+    if $sb_setup_ok; then
+        green "\nsing-box 安装完成！"
+    else
+        red "\n⚠ sing-box 安装流程已走完，但核心服务未能正常启动，节点当前不可用"
+        red "请检查：journalctl -u sing-box -n 50 --no-pager，排查后可到菜单「3. sing-box 管理」手动重启\n"
+    fi
 
     if is_fixed_tunnel_configured && [ "${TUNNEL_FULLY_RESTORED}" = true ]; then
         # sing-box 在装机流程中被重启过（大陆拦截配置、防火墙等步骤），
@@ -3133,9 +3155,13 @@ do_install() {
         # 的连接会停留在旧进程上，导致隧道能连通 Cloudflare 边缘节点、
         # 但转发到本地 vless-ws 时失败（journalctl -u argo 可见 "context canceled"）。
         # 此处显式重启 argo，让它与新启动的 sing-box 进程重新建立本地连接。
-        restart_argo
-        green "Argo 固定隧道已完整恢复（已同步重启 argo 服务）"
-        get_info
+        if restart_argo; then
+            green "Argo 固定隧道已完整恢复（已同步重启 argo 服务）"
+            get_info
+        else
+            red "Argo 隧道配置已恢复，但 argo 服务重启失败，节点当前不可用"
+            red "请检查：journalctl -u argo -n 50 --no-pager\n"
+        fi
     elif is_fixed_tunnel_configured && [ "${TUNNEL_TOKEN_MODE}" = true ]; then
         yellow "检测到 Token 模式隧道备份，域名：$(get_fixed_domain)"
         yellow "请进入 Argo 隧道管理 → 配置固定隧道，重新输入 Token 后用 sb -c 查看节点\n"
