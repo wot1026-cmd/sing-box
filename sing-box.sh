@@ -60,7 +60,10 @@ install_packages() {
     if [ ${#to_install[@]} -eq 0 ]; then
         return 0
     fi
-    apt-get update -y
+    if ! apt-get update -y; then
+        red "apt-get update 失败，请检查网络或软件源配置"
+        return 1
+    fi
     for pkg in "${to_install[@]}"; do
         yellow "正在安装 ${pkg}…"
         apt-get install -y "$pkg" || { red "${pkg} 安装失败"; return 1; }
@@ -294,7 +297,9 @@ install_singbox() {
         argo_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .listen_port' "${backup_dir}/inbounds.json")
         hy2_password=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "${backup_dir}/inbounds.json")
         # 兼容旧备份（密码与UUID相同的历史配置）：若读取失败则回退使用 uuid
-        [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ] && hy2_password="$uuid"
+        if [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ]; then
+            hy2_password="$uuid"
+        fi
 
         if [ -z "$uuid" ] || [ "$uuid" = "null" ] \
            || [ -z "$vless_path" ] || [ "$vless_path" = "null" ] \
@@ -739,7 +744,9 @@ get_info() {
     uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .users[0].uuid' "${conf_dir}/inbounds.json")
     hy2_password=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "${conf_dir}/inbounds.json")
     # 兼容旧配置（密码与UUID相同的历史配置）：若读取失败则回退使用 uuid
-    [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ] && hy2_password="$uuid"
+    if [ -z "$hy2_password" ] || [ "$hy2_password" = "null" ]; then
+        hy2_password="$uuid"
+    fi
 
     fingerprint=$(get_hy2_fingerprint)
     if [ -z "$fingerprint" ]; then
