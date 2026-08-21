@@ -281,12 +281,15 @@ install_singbox() {
     local restore_backup=false
 
     # ── 检测是否存在卸载时保留的备份配置 ──────────
+    RESTORE_DECLINED=false
     if [ -f "${backup_dir}/inbounds.json" ]; then
         yellow "\n检测到上次卸载时保留的节点配置备份"
         local restore_choice
         reading "是否恢复备份中的 UUID / 端口 / 隧道配置？(y/n，回车默认 y): " restore_choice
         if [[ -z "$restore_choice" || "$restore_choice" == [yY] ]]; then
             restore_backup=true
+        else
+            RESTORE_DECLINED=true
         fi
     fi
 
@@ -583,14 +586,20 @@ EOF
         red "\n⚠ sing-box 服务未能进入运行状态，请检查：journalctl -u sing-box -n 50 --no-pager\n"
         sb_start_ok=false
     fi
-    if ! systemctl enable argo; then
-        yellow "\n⚠ argo 设置开机自启失败，重启 VPS 后可能不会自动拉起隧道，请检查：systemctl status argo\n"
-    fi
 
     TUNNEL_FULLY_RESTORED=false
 
     if [ -f "${work_dir}/tunnel.yml" ]; then
+        # 只有已配置固定隧道时才需要 argo 常驻，才 enable 开机自启；
+        # 未配置隧道时保留上面写的 /bin/true 占位 unit（不 enable、不 start），
+        # 避免 check_argo 把"尚未配置"误判成"服务故障"。
+        # enable 必须放在 rebuild 成功之后：rebuild 失败（Token/凭据缺失）时
+        # /etc/systemd/system/argo.service 仍是上面写的占位 unit，若此时 enable，
+        # 重启机器会拉起一个 ExecStart=/bin/true 的假服务。
         if _rebuild_argo_service_from_tunnel_yml; then
+            if ! systemctl enable argo; then
+                yellow "\n⚠ argo 设置开机自启失败，重启 VPS 后可能不会自动拉起隧道，请检查：systemctl status argo\n"
+            fi
             systemctl daemon-reload
             systemctl restart argo
         fi
@@ -800,7 +809,8 @@ check_nodes() {
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         echo -e "\e[1;35m${line}\033[0m\n"
-        command_exists qrencode && qrencode -t ANSIUTF8 "$line"
+        # 分隔说明行（如"───── IP 直连 …"）不是链接，不生成二维码
+        [[ "$line" == *"://"* ]] && command_exists qrencode && qrencode -t ANSIUTF8 "$line"
         echo ""
     done < "${client_dir}"
 }
@@ -945,8 +955,8 @@ change_config() {
             if [ -z "$new_port" ]; then
                 new_port=$(pick_free_udp_port)
             else
-                if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-                    red "端口无效（1-65535）"; sleep 1; return 0
+                if ! [[ "$new_port" =~ ^[1-9][0-9]*$ ]] || (( new_port < 1 || new_port > 65535 )); then
+                    red "端口无效（1-65535，不含前导零）"; sleep 1; return 0
                 fi
                 if ss -ulnH | awk '{print $5}' | grep -q ":${new_port}$"; then
                     red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
@@ -963,26 +973,12 @@ change_config() {
                 rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return 0
             fi
             mv "$tmp_file" "$inbounds_file"
-            # 删旧端口规则（IPv4，精确删除避免误伤）
-            if ! iptables -D INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null; then
-                yellow "警告：未能删除旧端口 ${old_port} 的防火墙规则，可能需要手动检查 iptables"
+            # 用统一的 remove_port/allow_port（而非手动摘 DROP 再插回），
+            # 天然兼容 ufw 场景，且自带持久化，避免和防火墙状态不一致
+            if [ -n "$old_port" ] && [ "$old_port" != "null" ]; then
+                remove_port "${old_port}/udp"
             fi
-
-            # 摘下 DROP 兜底 → 追加新端口 → 重新压入 DROP（只操作 IPv4，v6 全 DROP 不动）
-            iptables -D INPUT -j DROP 2>/dev/null || true
-            iptables -A INPUT -p udp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-            iptables -A INPUT -j DROP 2>/dev/null || true
-
-            # 持久化（只存 IPv4，v6 规则固定不变）
-            mkdir -p /etc/iptables
-            local _t4
-            _t4=$(mktemp)
-            if [ -n "$_t4" ] && iptables-save > "$_t4" 2>/dev/null; then
-                mv "$_t4" /etc/iptables/rules.v4
-            else
-                rm -f "$_t4"
-                yellow "保存 rules.v4 失败"
-            fi
+            allow_port "${new_port}/udp"
 
             if restart_singbox; then
                 get_info
@@ -995,8 +991,8 @@ change_config() {
         3)
             reading "\n请输入新的 VLESS-Argo 端口（回车随机生成）: " new_port
             [ -z "$new_port" ] && new_port=$(pick_free_tcp_port)
-            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-                red "端口无效（1-65535）"; sleep 1; return 0
+            if ! [[ "$new_port" =~ ^[1-9][0-9]*$ ]] || (( new_port < 1 || new_port > 65535 )); then
+                red "端口无效（1-65535，不含前导零）"; sleep 1; return 0
             fi
             if ss -tlnH | awk '{print $5}' | grep -q ":${new_port}$"; then
                 red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
@@ -1066,7 +1062,9 @@ change_config() {
                 *)
                     if [[ "$input" =~ : ]]; then
                         cfip="${input%%:*}"; cfport="${input##*:}"
-                        [[ ! "$cfport" =~ ^[0-9]+$ ]] || (( cfport > 65535 )) && cfport="443"
+                        if ! [[ "$cfport" =~ ^[1-9][0-9]*$ ]] || (( cfport > 65535 )); then
+                            cfport="443"
+                        fi
                         # 若用户输入类似 ":8080" 这种，冒号前为空，cfip 会被解析成空字符串，
                         # 写入 CFIP= 空值会破坏 Argo 域名/IP 解析配置，此处兜底回退默认值
                         [ -z "$cfip" ] && cfip="cloudflare-ech.com"
@@ -1075,8 +1073,10 @@ change_config() {
                     fi
                     ;;
             esac
-            printf 'CFIP=%s\nCFPORT=%s\n' "$cfip" "$cfport" > "${work_dir}/cf.env"
-            chmod 600 "${work_dir}/cf.env"
+            if ! _write_cf_env_key CFIP "$cfip" || ! _write_cf_env_key CFPORT "$cfport"; then
+                red "\nCF 优选写入失败，请检查 ${work_dir}/cf.env 权限或磁盘空间\n"
+                return 0
+            fi
             get_info
             green "\nCF 优选已更新为：${cfip}:${cfport}\n"
             ;;
@@ -1460,6 +1460,20 @@ _ask_reuse_creds() {
     return 0
 }
 
+# 校验旧凭证存档字段是否合法：非空、非 JSON null 字面量
+# 用法：_creds_field_valid "$val" 或 _creds_field_valid "$val" port（端口额外校验数字范围）
+# 返回 0 = 合法，1 = 非法（调用方应回退为重新生成）
+_creds_field_valid() {
+    local val="$1" kind="$2"
+    [ -z "$val" ] && return 1
+    [ "$val" = "null" ] && return 1
+    if [ "$kind" = "port" ]; then
+        [[ "$val" =~ ^[0-9]+$ ]] || return 1
+        (( val >= 1 && val <= 65535 )) || return 1
+    fi
+    return 0
+}
+
 # =========================================================
 # add_protocol_tuic：生成 TUIC v5 inbound
 # 优先 acme.sh 申请真实证书；否则回退复用现有自签 cert.pem / private.key
@@ -1495,13 +1509,22 @@ add_protocol_tuic() {
         uuid=$(jq -r '.uuid' <<< "$old_json")
         password=$(jq -r '.password' <<< "$old_json")
         port=$(jq -r '.port' <<< "$old_json")
-        # 旧端口若已被占用（比如期间装了别的服务），自动换新端口，不阻塞流程
-        if ss -ulnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
-            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+        if ! _creds_field_valid "$uuid" \
+           || ! _creds_field_valid "$password" \
+           || ! _creds_field_valid "$port" port; then
+            yellow "旧配置存档已损坏，改为生成全新配置"
             port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+            password=$(openssl rand -hex 16)
+        else
+            # 旧端口若已被占用（比如期间装了别的服务），自动换新端口，不阻塞流程
+            if ss -ulnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+                yellow "旧端口 ${port} 已被占用，自动分配新端口"
+                port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
+            fi
+            reused=true
+            green "已复用 TUIC 旧配置（UUID/密码不变，客户端链接可能仅端口变化）"
         fi
-        reused=true
-        green "已复用 TUIC 旧配置（UUID/密码不变，客户端链接可能仅端口变化）"
     else
         port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
         uuid=$(cat /proc/sys/kernel/random/uuid)
@@ -1589,11 +1612,17 @@ add_protocol_reality() {
         old_json=$(_read_protocol_creds reality)
         uuid=$(jq -r '.uuid' <<< "$old_json")
         port=$(jq -r '.port' <<< "$old_json")
-        if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
-            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+        if ! _creds_field_valid "$uuid" || ! _creds_field_valid "$port" port; then
+            yellow "旧配置存档已损坏，改为生成全新配置"
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+            uuid=$(cat /proc/sys/kernel/random/uuid)
+        else
+            if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+                yellow "旧端口 ${port} 已被占用，自动分配新端口"
+                port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+            fi
+            green "已复用 Reality 旧配置（UUID/密钥对不变，客户端链接可能仅端口变化）"
         fi
-        green "已复用 Reality 旧配置（UUID/密钥对不变，客户端链接可能仅端口变化）"
     else
         port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
         uuid=$(cat /proc/sys/kernel/random/uuid)
@@ -1667,11 +1696,17 @@ add_protocol_anytls() {
         old_json=$(_read_protocol_creds anytls)
         password=$(jq -r '.password' <<< "$old_json")
         port=$(jq -r '.port' <<< "$old_json")
-        if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
-            yellow "旧端口 ${port} 已被占用，自动分配新端口"
+        if ! _creds_field_valid "$password" || ! _creds_field_valid "$port" port; then
+            yellow "旧配置存档已损坏，改为生成全新配置"
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+            password=$(openssl rand -hex 16)
+        else
+            if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+                yellow "旧端口 ${port} 已被占用，自动分配新端口"
+                port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
+            fi
+            green "已复用 AnyTLS 旧配置（密码不变，客户端链接可能仅端口变化）"
         fi
-        green "已复用 AnyTLS 旧配置（密码不变，客户端链接可能仅端口变化）"
     else
         port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
         password=$(openssl rand -hex 16)
@@ -2151,6 +2186,9 @@ EOF
     fi
 
     systemctl daemon-reload
+    if ! systemctl enable argo; then
+        yellow "⚠ argo 设置开机自启失败，重启 VPS 后可能不会自动拉起隧道，请检查：systemctl status argo"
+    fi
     if restart_argo; then
         sleep 2
         get_info
@@ -2178,9 +2216,11 @@ manage_argo() {
     skyblue "————"
     reading "\n请输入选择: " choice
     case "$choice" in
-        1) start_argo;   return 0 ;;
+        1) is_fixed_tunnel_configured || { yellow "尚未配置固定隧道，请先选择 4 配置"; return 0; }
+           start_argo;   return 0 ;;
         2) stop_argo;    return 0 ;;
-        3) restart_argo; return 0 ;;
+        3) is_fixed_tunnel_configured || { yellow "尚未配置固定隧道，请先选择 4 配置"; return 0; }
+           restart_argo; return 0 ;;
         4) configure_fixed_tunnel; return 0 ;;
         0) return 1 ;;
         *) red "无效选项！"; return 0 ;;
@@ -2254,6 +2294,23 @@ _do_uninstall_core() {
         # 彻底卸载（不保留配置）时才清理 acme 相关的 cron 任务（续期检查 + 证书同步）；
         # 保留配置场景下这些任务在重装恢复后仍需继续运行，不能清
         crontab -l 2>/dev/null | grep -v "# sing-box-extra-protocols acme" | crontab - 2>/dev/null
+
+        # 彻底卸载时同时恢复安装脚本对系统层做过的改动，语义是"恢复原状"：
+        # - 禁用 IPv6 的 sysctl 配置
+        # - BBR 调优 sysctl 配置
+        # - sshd 限制为仅监听 IPv4（AddressFamily inet）
+        # 以及安装/配置过程中残留的 .bak.* 备份文件
+        rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
+        rm -f /etc/sysctl.d/*.bak.* /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
+        if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
+            if sshd -t 2>/dev/null; then
+                systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+            else
+                yellow "警告：移除 sshd AddressFamily inet 后配置测试失败，请手动检查 /etc/ssh/sshd_config"
+            fi
+        fi
+        sysctl --system >/dev/null 2>&1
     fi
 
     systemctl stop    sing-box argo 2>/dev/null
@@ -2329,7 +2386,12 @@ update_script() {
     tmp=$(mktemp)
     curl -fsSL "$SCRIPT_URL" -o "$tmp"
     if [ -s "$tmp" ] && grep -q 'install_singbox' "$tmp"; then
-        mv "$tmp" "${work_dir}/sb.sh"
+        mkdir -p "${work_dir}"
+        if ! mv "$tmp" "${work_dir}/sb.sh"; then
+            rm -f "$tmp"
+            red "更新失败：无法写入 ${work_dir}/sb.sh\n"
+            return 1
+        fi
         chmod +x "${work_dir}/sb.sh"
         ln -sf "${work_dir}/sb.sh" /usr/bin/sb
         green "脚本已更新，请重新运行 sb\n"
@@ -2564,13 +2626,13 @@ bbr_apply_menu() {
         3) bbr_write_conf 4194304 "低延迟场景 (4MB)" 50 ;;
         4)
             reading "请输入带宽 (Mbps): " bw
-            if ! [[ "$bw" =~ ^[0-9]+$ ]] || [ "$bw" -eq 0 ]; then
+            if ! [[ "$bw" =~ ^[1-9][0-9]*$ ]]; then
                 red "输入无效，请输入正整数"
                 return 0
             fi
             reading "请输入预估RTT毫秒 (不清楚直接回车，默认150ms): " rtt
             [ -z "$rtt" ] && rtt=150
-            if ! [[ "$rtt" =~ ^[0-9]+$ ]] || [ "$rtt" -eq 0 ]; then
+            if ! [[ "$rtt" =~ ^[1-9][0-9]*$ ]]; then
                 red "RTT 输入无效，请输入正整数"
                 return 0
             fi
@@ -2915,6 +2977,12 @@ EOF
     # ── 7. ICMP 限速（防 ping flood，正常 ping 不受影响）──
     iptables -A INPUT -p icmp --icmp-type echo-request \
         -m limit --limit 1/s --limit-burst 5 -j ACCEPT 2>/dev/null || true
+    # destination-unreachable（含 fragmentation-needed）和 time-exceeded 必须放行，
+    # 否则 PMTUD 失效：发送端收不到"包太大需要分片"的通知，UDP 协议
+    # （Hysteria2/TUIC 均基于 UDP，无 TCP MSS 协商机制）在路径 MTU 较小的
+    # 链路（如经过 Argo/Cloudflare 隧道）上会出现大包黑洞、握手卡死
+    iptables -A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p icmp --icmp-type time-exceeded -j ACCEPT 2>/dev/null || true
     iptables -A INPUT -p icmp -j DROP 2>/dev/null || true
 
     # ── 8. 放行 SSH 端口（优先 sshd_config，兜底 ss 探测）──
@@ -3124,7 +3192,10 @@ do_install() {
     [ -f "${backup_dir}/argo_token" ] && backup_has_token=true
 
     if [ -s "${conf_dir}/inbounds.json" ]; then
-        if $backup_has_token && [ "${ARGO_TOKEN_RESTORED:-false}" != true ]; then
+        if [ "${RESTORE_DECLINED:-false}" = true ]; then
+            # 用户主动选择不恢复备份，不是恢复失败，无需警告，按原样保留备份目录
+            [ -d "$backup_dir" ] && true
+        elif $backup_has_token && [ "${ARGO_TOKEN_RESTORED:-false}" != true ]; then
             yellow "警告：备份中存在 Token 但未能成功恢复到 ${work_dir}，保留备份目录以便排查"
             yellow "请检查 ${backup_dir}/argo_token 内容，确认无误后可手动删除该目录"
         else
