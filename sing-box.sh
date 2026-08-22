@@ -2706,6 +2706,10 @@ bbr_scan() {
         BBR_SCAN_FILES[$idx]="$f"
         if [ "$f" = "$BBR_CONF" ]; then
             skyblue "[${idx}] ${f}  ← 本脚本生成的配置（用「关闭调优」处理，不在此清理）"
+        elif [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]]; then
+            skyblue "[${idx}] ${f}  ← 历史备份文件，不会被系统加载"
+        elif [ -z "$(grep -E "$BBR_KEYWORDS" "$f" 2>/dev/null | grep -v '^[[:space:]]*#')" ]; then
+            skyblue "[${idx}] ${f}  ← 已全部处理为注释，无需再清理"
         else
             purple "[${idx}] ${f}"
         fi
@@ -2739,23 +2743,36 @@ bbr_clean() {
 
     echo ""
     yellow "重要提示：以上文件里可能混有 BBR 之外的其他配置（安全加固、IPv6、端口范围等），"
-    yellow "本功能不会整份删除文件，只会帮你注释掉扫描到的冲突网络参数那一行，其余内容保持不变。\n"
+    yellow "本功能不会整份删除文件，只会自动注释掉扫描到的冲突网络参数那一行，其余内容保持不变。"
+    yellow "本脚本自己的配置、历史备份文件（.bak）、已处理过的文件会自动跳过，无需你判断。\n"
 
-    reading "请输入要处理的编号 (空格分隔，如 \"1 2\"，或输入 0 取消): " nums
-    [ -z "$nums" ] || [ "$nums" = "0" ] && { purple "已取消"; return 0; }
+    reading "确认自动清理以上所有冲突文件？(y/N): " confirm_clean
+    if [[ ! "$confirm_clean" =~ ^[yY]$ ]]; then
+        purple "已取消"
+        return 0
+    fi
 
-    for n in $nums; do
-        local target="${BBR_SCAN_FILES[$n]}"
-        if [ -z "$target" ]; then
-            red "编号 ${n} 无效，跳过"
-            continue
-        fi
+    local n target
+    for n in "${!BBR_SCAN_FILES[@]}"; do
+        target="${BBR_SCAN_FILES[$n]}"
+
         if [ "$target" = "$BBR_CONF" ]; then
-            yellow "编号 ${n} 是本脚本自己的配置，跳过（请用「关闭调优」处理）"
+            yellow "跳过 ${target}（本脚本自己的配置，请用「关闭调优」处理）"
             continue
         fi
-        if [[ "$target" == *.bak ]]; then
-            yellow "${target} 是 .bak 文件，不会被 sysctl 加载，无实际影响，跳过"
+        # 历史备份文件命名为 .bak.时间戳（如 xxx.conf.bak.20260716034523），
+        # 不会被 sysctl 加载，处理它毫无意义；旧版判断只匹配纯 ".bak" 结尾，
+        # 漏掉了这种真实生成的命名格式，导致脚本自己生成的备份被反复重新处理、
+        # 越积越多。这里改用能同时匹配两种格式的写法。
+        if [[ "$target" == *.bak || "$target" =~ \.bak\.[0-9]+$ ]]; then
+            yellow "跳过 ${target}（历史备份文件，不会被系统加载，无实际影响）"
+            continue
+        fi
+        # 若文件里涉及关键字的行已经全部是注释状态，说明之前处理过、当前不再生效，
+        # 无需重复处理（避免产生没有意义的新备份文件）
+        if ! grep -qE "$BBR_KEYWORDS" "$target" 2>/dev/null || \
+           [ -z "$(grep -E "$BBR_KEYWORDS" "$target" 2>/dev/null | grep -v '^[[:space:]]*#')" ]; then
+            yellow "跳过 ${target}（相关配置已全部是注释状态，无需重复处理）"
             continue
         fi
 
