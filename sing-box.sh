@@ -199,10 +199,7 @@ download_singbox() {
     curl -fsSLo "$tmp_tar" "${base_url}/${tarball}" \
         || { red "sing-box 下载失败"; rm -f "$tmp_tar"; rm -rf "$tmp_dir"; return 1; }
 
-    # GitHub 从2025年6月起对每个 release asset 自动生成并暴露 SHA256（.assets[].digest，
-    # 上传时算出、不可变），不依赖项目方是否额外发布 checksum 文件，用 Releases API 取到
-    # 期望值后本地核对一遍，校验失败就中止，不进入解压/安装。API 请求失败（限流等）时
-    # 只警告不阻断，避免因为校验环节本身网络问题导致完全装不了。
+    # 用 GitHub Releases API 的 asset digest 校验 SHA256，API 失败只警告不阻断
     local expected_sha remote_sha
     expected_sha=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${version}" 2>/dev/null \
         | jq -r --arg name "$tarball" '.assets[] | select(.name == $name) | .digest // empty' 2>/dev/null \
@@ -240,9 +237,7 @@ download_cloudflared() {
     curl -fsSLo "$tmp_file" "${base_url}/${bin_name}" \
         || { red "cloudflared 下载失败"; rm -f "$tmp_file"; return 1; }
 
-    # /latest/download/ 是重定向别名，不带版本号，无法直接从 tag 查 digest；
-    # 先跟随重定向拿到实际的 release tag，再用该 tag 去查这个 asset 的 SHA256。
-    # 同样是 API 失败只警告不阻断。
+    # 先解析出实际 release tag，再查该 asset 的 SHA256 做校验
     local resolved_url latest_tag expected_sha remote_sha
     resolved_url=$(curl -fsSLo /dev/null -w '%{url_effective}' \
         "https://github.com/cloudflare/cloudflared/releases/latest" 2>/dev/null)
@@ -270,10 +265,7 @@ download_cloudflared() {
 }
 
 # ── 原子写入 JSON 配置文件 ─────────────────────────
-# 用法：write_json_atomic <目标路径> <<EOF ... EOF
-# 从 stdin 读内容先写到 mktemp 临时文件，jq 校验语法通过后才 mv 到目标路径；
-# 磁盘满/权限异常/内容不是合法 JSON 时直接返回非0，不会把半成品或空文件
-# 落到目标路径上，调用方需要检查返回值。
+# 用法：write_json_atomic <目标路径> <<EOF ... EOF ，调用方需检查返回值
 write_json_atomic() {
     local dest="$1" tmp
     tmp=$(mktemp) || { red "创建临时文件失败：${dest}"; return 1; }
@@ -438,7 +430,6 @@ install_singbox() {
             red "生成自签证书失败，已中止"
             return 1
         fi
-        # openssl 部分失败场景下命令仍返回0但文件为空/缺失，双重保险再确认一次
         if [ ! -s "${work_dir}/private.key" ] || [ ! -s "${work_dir}/cert.pem" ]; then
             red "TLS 证书或私钥文件为空，生成异常，已中止"
             return 1
@@ -1430,8 +1421,6 @@ _ensure_acme_sh_installed() {
     # 不传 email 参数：acme.sh 官方文档确认该参数默认即为空，不是必需项。
     # 曾尝试用 hostname -f 拼邮箱，但多数云 VPS 的 hostname -f 只返回短主机名（如 "74"），
     # 拼出的 "acme@74" 不是合法邮箱格式，可能导致 CA 账号注册被拒——不传更安全。
-    # 先下载到本地再执行（而不是 curl | sh 直接管道执行），方便下载失败时定位问题，
-    # 也留了一份安装脚本可供审计；用完即删。
     local _acme_installer
     _acme_installer=$(mktemp)
     if ! curl -fsSL https://get.acme.sh -o "$_acme_installer" 2>/dev/null; then
@@ -2649,12 +2638,9 @@ BBR_CONF="/etc/sysctl.d/99-wot-proxy-tuning.conf"
 BBR_KEYWORDS='tcp_|rmem|wmem|conntrack|congestion_control|qdisc'
 BBR_INITCWND_UNIT="/etc/systemd/system/wot-initcwnd.service"
 BBR_INITCWND_SCRIPT="/usr/local/sbin/wot-initcwnd.sh"
-# 记录 bbr_autofix_conflicts 自动注释过哪些文件的哪一行（每行格式：文件路径<TAB>行号），
-# 关闭调优时据此把这些行原样恢复，而不是只删掉自己的配置文件了事。
-# 注意：只记 BBR 自己触发的注释。IPv6 清理有自己独立的 IPV6_AUTOFIX_LOG——两者共用
-# 一份日志会导致"BBR 从没启用过就直接 return"时，IPv6 那部分记录永远没人来恢复。
+# 自动注释冲突配置的记录（文件路径<TAB>行号），关闭调优/卸载时据此恢复原状；
+# BBR 和 IPv6 各自独立，避免互相漏恢复。
 BBR_AUTOFIX_LOG="/etc/sing-box/bbr-autofix.log"
-# IPv6 自动清理冲突配置时的恢复日志，跟 BBR 的完全独立，卸载时单独调用恢复。
 IPV6_AUTOFIX_LOG="/etc/sing-box/ipv6-autofix.log"
 
 # initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
@@ -2785,9 +2771,7 @@ bbr_autofix_conflicts() {
         [ "$actual" = "$val" ] && continue    # 生效值已经和期望一致，无需处理
 
         # 生效值不一致，说明有别的文件在覆盖 —— 逐个文件检查是否定义了这个 key
-        # 且值不同，是的话注释掉那一行（跳过 BBR_CONF 自己和历史备份文件）。
-        # 注意：只处理 /etc 下的用户配置，/usr/lib/sysctl.d/ 属于发行版/厂商包管理
-        # 范围，apt upgrade 可能覆盖它，脚本不应该直接改动，只记录下来提示用户。
+        # 且值不同，是的话注释掉那一行。/usr/lib/sysctl.d/ 属于系统包管理，不动。
         local f
         for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
             [ -f "$f" ] || continue
@@ -2795,16 +2779,10 @@ bbr_autofix_conflicts() {
             [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
             grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$f" 2>/dev/null || continue
             if [[ "$backed_up_files" != *$'\n'"$f"$'\n'* ]]; then
-                # 本次调用中这是第一次动这个文件：先清掉它自己之前遗留的旧备份，
-                # 只保留"这次清理开始前"这一份最新备份，避免反复切换场景时
-                # .bak.时间戳 文件无限累积。
                 rm -f "${f}.bak."[0-9]*
                 cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
                 backed_up_files="${backed_up_files}${f}"$'\n'
             fi
-            # 注释前先记下具体行号（可能有多行匹配同一个 key，逐行记录），
-            # 关闭调优时凭"文件+行号"精确定位、去掉本脚本加的注释前缀，
-            # 而不是靠 .bak 文件整份回滚（.bak 会连同用户后续的其他改动一起丢掉）。
             local ln
             while IFS=: read -r ln; do
                 [ -z "$ln" ] && continue
@@ -2814,10 +2792,7 @@ bbr_autofix_conflicts() {
             sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
             fixed_any=1
         done
-        # /usr/lib/sysctl.d/ 下如果也有冲突，只提示不动手；本脚本用 99- 前缀的
-        # 文件名（sysctl.d 按文件名排序加载，99 排在厂商默认的数字前缀之后），
-        # 正常情况下已经能覆盖厂商默认值，这里只是把"还有别的地方定义了它"
-        # 这个事实告诉用户。
+        # /usr/lib/sysctl.d/ 只提示不动手
         local libf
         for libf in /usr/lib/sysctl.d/*.conf; do
             [ -f "$libf" ] || continue
@@ -2861,7 +2836,7 @@ net.core.netdev_max_backlog = 8192
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
 
-# ── TCP 连接优化（这几项只是打开特性开关，不改变默认超时/重试行为，风险低）──
+# ── TCP 连接优化 ──
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
@@ -2885,11 +2860,9 @@ net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 EOF
     if [[ "$aggressive" =~ ^[yY]$ ]]; then
-        # 这几项会改变内核 TCP 默认超时/重试/MTU探测行为，影响面比上面那组更大，
-        # 不适合所有机器统一套用，只在用户明确选择时才追加。
         cat >> "$BBR_CONF" << EOF
 
-# ── 以下为"改变TCP默认行为"的进阶参数，用户已确认启用 ──
+# ── 进阶参数（改变TCP默认超时/重试/MTU行为）──
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_retries2 = 15
 net.ipv4.tcp_syn_retries = 3
@@ -2913,8 +2886,6 @@ EOF
     else
         red "\n配置已写入，但验证异常 (拥塞控制=${cc}, 队列=${qdisc}, 缓冲区=${rmem}，期望值=${buf})\n请检查是否有其他文件覆盖了此设置（可用「扫描冲突配置」查看）\n"
     fi
-    # initcwnd 32 首波突发较大，在低带宽（≤100Mbps）或有流量整形的链路上有小概率
-    # 打穿限速器引发首秒重传，不适合默认无条件开启，改成询问，默认关闭。
     local initcwnd_choice
     reading "是否同时启用 initcwnd/initrwnd=32（加快短连接首屏，低带宽/有限速的链路不建议）？(y/N): " initcwnd_choice
     if [[ "$initcwnd_choice" =~ ^[yY]$ ]]; then
@@ -2980,10 +2951,7 @@ bbr_apply_menu() {
 }
 
 restore_autofixed_lines() {
-    # 通用版：把某份 autofix 日志里记录的、自动注释掉的行原样恢复。
-    # $1 = 日志文件路径（BBR_AUTOFIX_LOG 或 IPV6_AUTOFIX_LOG）。
-    # 按"文件+行号"精确定位，只去掉本脚本加的注释前缀，不影响文件里其他内容
-    # （不用 .bak 整份回滚，因为 .bak 之后用户可能又手动改过该文件的其他部分）。
+    # $1 = 日志路径。按"文件+行号"精确恢复，不用 .bak 整份回滚。
     local log="$1"
     [ -f "$log" ] || return 0
     local file line restored=0
@@ -2991,7 +2959,6 @@ restore_autofixed_lines() {
         [ -z "$file" ] && continue
         [ -z "$line" ] && continue
         [ -f "$file" ] || continue
-        # 只在该行确实是本脚本加的注释格式时才恢复，避免误改用户之后手动编辑过的行
         if sed -n "${line}p" "$file" 2>/dev/null | grep -qE '^[[:space:]]*# \[由sing-box\.sh(自动清理|注释)\] '; then
             sed -i "${line}s|^\([[:space:]]*\)# \[由sing-box\.sh\(自动清理\|注释\)\] |\1|" "$file"
             restored=1
@@ -3021,8 +2988,6 @@ bbr_disable() {
             mv "$BBR_CONF" "${BBR_CONF}.bak.${ts}"
         fi
         bbr_remove_initcwnd
-        # 先恢复被自动注释的其他文件，再统一 reload 一次，这样"关闭调优"
-        # 才是真的把系统还原到本脚本介入之前的状态，而不只是删掉自己的配置。
         bbr_restore_autofixed_lines
         sysctl --system >/dev/null 2>&1
         if [ -n "$ts" ]; then
@@ -3117,8 +3082,7 @@ bbr_clean() {
             yellow "跳过 ${target}（历史备份文件，不会被系统加载，无实际影响）"
             continue
         fi
-        # /usr/lib/sysctl.d/ 属于发行版/厂商包管理范围，apt upgrade 可能覆盖它，
-        # 脚本不修改该目录下的文件，只提示用户自行处理。
+        # /usr/lib/sysctl.d/ 属于系统包管理，不修改，只提示
         if [[ "$target" == /usr/lib/sysctl.d/* ]]; then
             yellow "跳过 ${target}（系统/厂商配置，本脚本不会修改，如有冲突请手动处理）"
             continue
@@ -3179,8 +3143,6 @@ dns_apply() {
         elif grep -q "^#DNS=" /etc/systemd/resolved.conf 2>/dev/null; then
             sed -i "s/^#DNS=.*/DNS=${dns1} ${dns2}/" /etc/systemd/resolved.conf
         else
-            # 文件里既没有 DNS= 也没有 #DNS=（精简系统可能整个 [Resolve] 段都没有），
-            # 直接 append 有可能落到 [Resolve] 段之外导致不生效；先确认段存在。
             if grep -q "^\[Resolve\]" /etc/systemd/resolved.conf 2>/dev/null; then
                 echo "DNS=${dns1} ${dns2}" >> /etc/systemd/resolved.conf
             else
@@ -3196,8 +3158,6 @@ nameserver ${dns1}
 nameserver ${dns2}
 EOF
         green "\n已直接写入 /etc/resolv.conf，DNS: ${dns1} ${dns2}\n"
-        # /etc/resolv.conf 若被 NetworkManager 或 systemd-networkd 接管，
-        # 下次 DHCP 续租/重启网络服务时可能把这里的直接写入覆盖掉，提前提示。
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet NetworkManager 2>/dev/null; then
                 yellow "检测到 NetworkManager 正在运行，它可能在下次网络重连/DHCP续租时覆盖 /etc/resolv.conf，如发现DNS又变回去，请在 NetworkManager 里单独设置DNS。"
@@ -3323,10 +3283,6 @@ setup_firewall_base() {
     fi
 
     # ── 1. 禁用 IPv6（内核层，使用 sysctl.d 覆盖云厂商配置）──
-    # 本脚本按 IPv4 VPS 场景设计，防火墙/端口放行等逻辑都只按 IPv4 实现，
-    # 不提供"保留 IPv6"选项——之前尝试同时支持两种模式时，保留分支的 IPv6
-    # 入站服务实际上仍会被防火墙挡住（SSH/Hy2/TUIC等端口只在IPv4放行），
-    # 半吊子支持反而比直接禁用更容易让人误判。直接禁用，行为单一、可预期。
     yellow "本脚本按 IPv4 VPS 场景设计，正在禁用 IPv6…"
     if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
         yellow "检测到未禁用 IPv6，正在禁用…"
@@ -3397,8 +3353,6 @@ EOF
     fi
 
     # ── 2. IPv6 防火墙 ──
-    # IPv6 已在上一步禁用，内核层不会再收发 v6 流量，这里直接全 DROP 无副作用，
-    # 不需要像之前"保留IPv6"分支那样额外放行 ESTABLISHED/RELATED、NDP 等。
     ip6tables -P INPUT ACCEPT 2>/dev/null || true
     ip6tables -F INPUT 2>/dev/null || true
     ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
