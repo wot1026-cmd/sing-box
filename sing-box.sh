@@ -2750,18 +2750,24 @@ bbr_apply_menu() {
 }
 
 bbr_disable() {
-    if [ ! -f "$BBR_CONF" ]; then
+    if [ ! -f "$BBR_CONF" ] && [ ! -f "$BBR_INITCWND_UNIT" ]; then
         yellow "\n未检测到本脚本生成的调优配置，无需关闭\n"
         return 0
     fi
     reading "确定要关闭本脚本的调优配置吗? 将恢复系统默认值 (y/n): " confirm
     if [[ "$confirm" == [yY] ]]; then
         local ts
-        ts=$(date +%Y%m%d%H%M%S)
-        mv "$BBR_CONF" "${BBR_CONF}.bak.${ts}"
-        sysctl --system >/dev/null 2>&1
+        if [ -f "$BBR_CONF" ]; then
+            ts=$(date +%Y%m%d%H%M%S)
+            mv "$BBR_CONF" "${BBR_CONF}.bak.${ts}"
+            sysctl --system >/dev/null 2>&1
+        fi
         bbr_remove_initcwnd
-        green "\n已关闭，配置已备份为 ${BBR_CONF}.bak.${ts}\n"
+        if [ -n "$ts" ]; then
+            green "\n已关闭，配置已备份为 ${BBR_CONF}.bak.${ts}\n"
+        else
+            green "\n已关闭（仅清理了 initcwnd 持久化配置，未发现 sysctl 调优文件）\n"
+        fi
     else
         purple "已取消"
     fi
