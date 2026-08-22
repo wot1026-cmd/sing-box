@@ -2524,7 +2524,13 @@ bbr_get_status() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     if [ -f "$BBR_CONF" ]; then
-        echo "本脚本调优: 已启用 (${cc} + ${qdisc})"
+        local scenario
+        scenario=$(grep -m1 "^# 场景:" "$BBR_CONF" 2>/dev/null | sed 's/^# 场景: *//')
+        if [ -n "$scenario" ]; then
+            echo "本脚本调优: 已启用 (${cc} + ${qdisc})，当前场景: ${scenario}"
+        else
+            echo "本脚本调优: 已启用 (${cc} + ${qdisc})"
+        fi
     elif [ "$cc" = "bbr" ]; then
         echo "本脚本调优: 未启用，但检测到其他来源已开启 BBR (${cc} + ${qdisc})"
     else
