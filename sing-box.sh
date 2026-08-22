@@ -2568,7 +2568,10 @@ bbr_measure_rtt() {
         out=$(ping -c 3 -W 1 "$t" 2>/dev/null | tail -1)
         avg=$(echo "$out" | awk -F'/' '{print $5}')
         [[ "$avg" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
-        avg=${avg%.*}
+        # 四舍五入取整而非直接截断小数部分，避免同机房/优质直连线路下
+        # 真实RTT<1ms（如0.6ms）被砍成0，进而让后续BDP公式整体归零。
+        avg=$(awk -v v="$avg" 'BEGIN { printf "%d", v + 0.5 }')
+        [ "$avg" -lt 1 ] && avg=1
         if [ -z "$best" ] || [ "$avg" -lt "$best" ]; then
             best="$avg"
         fi
