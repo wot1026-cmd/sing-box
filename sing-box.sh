@@ -2309,10 +2309,10 @@ _do_uninstall_core() {
 
         # 彻底卸载时同时恢复安装脚本对系统层做过的改动，语义是"恢复原状"：
         # - 禁用 IPv6 的 sysctl 配置
-        # - BBR 调优 sysctl 配置
+        # - BBR 调优 sysctl 配置及模块自动加载配置
         # - sshd 限制为仅监听 IPv4（AddressFamily inet）
         # 以及安装/配置过程中残留的 .bak.* 备份文件
-        rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
+        rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf /etc/modules-load.d/99-wot-proxy-bbr.conf
         rm -f /etc/sysctl.d/*.bak.* /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
         if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
             sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
@@ -2517,7 +2517,90 @@ EOF
 
 # ── BBR 网络调优管理 ──────────────────────────────────
 BBR_CONF="/etc/sysctl.d/99-wot-proxy-tuning.conf"
+BBR_MODULES_CONF="/etc/modules-load.d/99-wot-proxy-bbr.conf"
 BBR_KEYWORDS='tcp_|rmem|wmem|conntrack|congestion_control|qdisc'
+# 已知可在 tcp_available_congestion_control 中被单独选中的增强版 BBR 算法，按优先级排列。
+# 注意：XanMod 等内核不会额外暴露一个叫 "bbr3" 的算法名——它们的 bbr 底层就是 BBRv3 实现，
+# 直接选 bbr 即可自动享受，无需也无法单独指定 bbr3。这里列的都是需要手动装 DKMS 模块
+# （如 hrimfaxi/tcp_bbr_modules、KozakaiAya/TCP_BBR）才会出现的真实存在的独立算法名，
+# 绝大多数机器这里只会命中最后的 bbr。
+BBR_ALGO_PRIORITY="bbr2 bbrplus tsunami nanqinlang bbr"
+
+# 确保 BBR 内核模块可用：已加载则直接返回；未加载就尝试 modprobe，成功后把加载动作
+# 持久化到 /etc/modules-load.d/，避免"这次手动 modprobe 生效，重启后又没了"。
+# 返回 0 = 可用；返回 1 = 内核确实不支持（版本过旧或模块缺失，需要升级内核）。
+bbr_ensure_module() {
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        return 0
+    fi
+    command_exists modprobe || return 1
+    modprobe tcp_bbr 2>/dev/null
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        echo "tcp_bbr" > "$BBR_MODULES_CONF"
+        return 0
+    fi
+    return 1
+}
+
+# 按 BBR_ALGO_PRIORITY 从本机 tcp_available_congestion_control 中挑出实际可用的最优算法名。
+# 找不到任何一个（理论上不会发生，因为 bbr 兜底）时返回非 0。
+bbr_pick_algo() {
+    local available algo
+    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+    for algo in $BBR_ALGO_PRIORITY; do
+        if [[ " $available " == *" $algo "* ]]; then
+            echo "$algo"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 对 1.1.1.1 / 8.8.8.8 各 ping 3 次，取探测成功的目标里最小的平均 RTT（整数毫秒）。
+# 出站 ICMP 被防火墙拦截、或没有 ping 命令时，退回默认值 150ms（返回码置 1 提示调用方这是兜底值）。
+bbr_measure_rtt() {
+    local targets=("1.1.1.1" "8.8.8.8") t out avg best=""
+    if ! command_exists ping; then
+        echo 150
+        return 1
+    fi
+    for t in "${targets[@]}"; do
+        out=$(ping -c 3 -W 1 "$t" 2>/dev/null | tail -1)
+        avg=$(echo "$out" | awk -F'/' '{print $5}')
+        [[ "$avg" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        avg=${avg%.*}
+        if [ -z "$best" ] || [ "$avg" -lt "$best" ]; then
+            best="$avg"
+        fi
+    done
+    if [ -z "$best" ]; then
+        echo 150
+        return 1
+    fi
+    echo "$best"
+    return 0
+}
+
+# 用 Cloudflare 测速端点下载 50MB 估算出口带宽 (Mbps)，15 秒超时兜底。
+# 链路够快会提前跑完拿到准确均值；链路慢则在 15 秒处被截断，仍按已传输量估算，
+# 足够作为 BDP 公式的输入。失败（DNS/网络不可达等）返回非 0，不输出任何内容。
+bbr_measure_bandwidth() {
+    local bytes=52428800 speed_bps rc mbps
+    speed_bps=$(curl -o /dev/null -s -m 15 -w '%{speed_download}' \
+        "https://speed.cloudflare.com/__down?bytes=${bytes}" 2>/dev/null)
+    rc=$?
+    # rc=0 是完整下载完成；rc=28 是 -m 超时被中止，但期间可能已经传输了部分数据，仍可参考；
+    # 其余错误码（DNS解析失败/连接失败等）视为探测失败，不产生任何输出。
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ]; then
+        return 1
+    fi
+    [[ "$speed_bps" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+    mbps=$(awk -v b="$speed_bps" 'BEGIN { printf "%d", (b * 8 / 1000000) }')
+    # 换算后仍为 0，通常说明还没真正开始传输就中断了（比如刚连上就被 -m 掐断），同样按失败处理
+    [ "$mbps" -gt 0 ] || return 1
+    echo "$mbps"
+    return 0
+}
 
 bbr_get_status() {
     local cc qdisc
@@ -2525,8 +2608,8 @@ bbr_get_status() {
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     if [ -f "$BBR_CONF" ]; then
         echo "本脚本调优: 已启用 (${cc} + ${qdisc})"
-    elif [ "$cc" = "bbr" ]; then
-        echo "本脚本调优: 未启用，但检测到其他来源已开启 BBR (${cc} + ${qdisc})"
+    elif [[ "$cc" =~ ^(bbr|bbr2|bbrplus|tsunami|nanqinlang)$ ]]; then
+        echo "本脚本调优: 未启用，但检测到其他来源已开启 BBR 类算法 (${cc} + ${qdisc})"
     else
         echo "本脚本调优: 未启用 (当前: ${cc} + ${qdisc})"
     fi
@@ -2553,20 +2636,31 @@ bbr_mem_buffer_cap() {
 
 bbr_write_conf() {
     # $1 = rmem/wmem 上限字节数, $2 = 场景描述文字, $3 = RTT毫秒（可选，用于 notsent_lowat 分档，默认150）
-    local buf="$1" desc="$2" rtt="${3:-150}" notsent_lowat
+    local buf="$1" desc="$2" rtt="${3:-150}" notsent_lowat algo prev_cc prev_qdisc
     if [ "$rtt" -ge 120 ]; then
         notsent_lowat=16384
     else
         notsent_lowat=32768
     fi
+
+    if ! bbr_ensure_module; then
+        red "\n当前内核不支持 BBR（模块缺失或内核过旧，需 4.9+，推荐 5.4+），已取消写入\n"
+        yellow "可手动确认: modprobe tcp_bbr && cat /proc/sys/net/ipv4/tcp_available_congestion_control\n"
+        return 1
+    fi
+    algo=$(bbr_pick_algo) || algo="bbr"
+    prev_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    prev_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
     cat > "$BBR_CONF" << EOF
 # 由 sing-box.sh 网络调优模块生成
 # 场景: ${desc}
 # 生成时间: $(date)
+# 生效前原值(人工回退参考): congestion_control=${prev_cc:-未知} qdisc=${prev_qdisc:-未知}
 
 # ── 拥塞控制 ──
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${algo}
 
 # ── 缓冲区 (随场景变化) ──
 net.core.rmem_max = ${buf}
@@ -2614,8 +2708,9 @@ EOF
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
-    if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ] && [ "$rmem" = "$buf" ]; then
+    if [ "$cc" = "$algo" ] && [ "$qdisc" = "fq" ] && [ "$rmem" = "$buf" ]; then
         green "\n已应用「${desc}」\n拥塞控制: ${cc}    队列: ${qdisc}    缓冲区上限: ${rmem}    notsent_lowat: ${notsent_lowat}\n"
+        [ "$algo" != "bbr" ] && yellow "检测到本机已装有增强版算法 ${algo}，本次已优先启用（而非默认 bbr）\n"
     else
         red "\n配置已写入，但验证异常 (拥塞控制=${cc}, 队列=${qdisc}, 缓冲区=${rmem}，期望值=${buf})\n请检查是否有其他文件覆盖了此设置（可用「扫描冲突配置」查看）\n"
     fi
@@ -2628,7 +2723,8 @@ bbr_apply_menu() {
     green  "1. 日常场景      缓冲区 8MB  | 不追求跑满带宽，网页/聊天/一般视频够用"
     green  "2. 大文件/下载   缓冲区 32MB | 追求单连接吞吐，适合美国等高延迟节点"
     green  "3. 低延迟场景    缓冲区 4MB  | 韩国/日本等低延迟节点，游戏/实时性优先"
-    green  "4. 自定义带宽    输入 Mbps，按 BDP 公式现算"
+    green  "4. 自定义带宽    输入 Mbps，RTT 自动探测(可覆盖)，按 BDP 公式现算"
+    green  "5. 全自动检测    自动测速 + 自动探测 RTT，全程无需手动输入数值"
     purple "0. 返回上一级"
     skyblue "————"
     reading "\n请输入选择: " choice
@@ -2642,31 +2738,53 @@ bbr_apply_menu() {
                 red "输入无效，请输入正整数"
                 return 0
             fi
-            reading "请输入预估RTT毫秒 (不清楚直接回车，默认150ms): " rtt
-            [ -z "$rtt" ] && rtt=150
+            yellow "正在探测 RTT…\n"
+            local auto_rtt rtt
+            auto_rtt=$(bbr_measure_rtt)
+            reading "探测到 RTT ≈ ${auto_rtt}ms，直接回车采用，或输入毫秒数手动覆盖: " rtt
+            [ -z "$rtt" ] && rtt="$auto_rtt"
             if ! [[ "$rtt" =~ ^[1-9][0-9]*$ ]]; then
                 red "RTT 输入无效，请输入正整数"
                 return 0
             fi
-            local bw_bps bdp_bytes buf_bytes mem_cap
-            bw_bps=$((bw * 1000000))
-            bdp_bytes=$((bw_bps * rtt / 1000 / 8))
-            buf_bytes=$((bdp_bytes * 2))
-            [ "$buf_bytes" -lt 4194304 ] && buf_bytes=4194304
-            # 先按硬性上限 128MB 截断，再用机器内存做安全封顶（小内存机器封顶更低，
-            # 防止 BDP 公式在小内存实例上算出过大的值而挤占可用内存）。
-            [ "$buf_bytes" -gt 134217728 ] && buf_bytes=134217728
-            mem_cap=$(bbr_mem_buffer_cap)
-            if [ "$buf_bytes" -gt "$mem_cap" ]; then
-                yellow "\n按 BDP 公式算出的缓冲区超过本机内存安全上限，已从 $((buf_bytes / 1024 / 1024))MB 封顶至 $((mem_cap / 1024 / 1024))MB\n"
-                buf_bytes="$mem_cap"
+            bbr_apply_bdp "$bw" "$rtt" "自定义 (${bw}Mbps / ${rtt}ms RTT)"
+            ;;
+        5)
+            yellow "\n正在自动探测带宽与 RTT，测速会产生约 50MB 流量，可能需要几秒到十几秒…\n"
+            local auto_rtt auto_bw
+            auto_rtt=$(bbr_measure_rtt)
+            auto_bw=$(bbr_measure_bandwidth)
+            if [ -z "$auto_bw" ]; then
+                red "带宽自动探测失败（出站可能受限，或测速端点不可达），请改用选项 4 手动输入带宽"
+                return 0
             fi
-            yellow "\nBDP ≈ $((bdp_bytes / 1024 / 1024))MB，取2倍余量，最终缓冲区上限 = $((buf_bytes / 1024 / 1024))MB\n"
-            bbr_write_conf "$buf_bytes" "自定义 (${bw}Mbps / ${rtt}ms RTT)" "$rtt"
+            yellow "探测结果: 带宽 ≈ ${auto_bw}Mbps  RTT ≈ ${auto_rtt}ms\n"
+            bbr_apply_bdp "$auto_bw" "$auto_rtt" "全自动检测 (${auto_bw}Mbps / ${auto_rtt}ms RTT)"
             ;;
         0) return 1 ;;
         *) red "无效选项"; return 0 ;;
     esac
+}
+
+# 把 带宽(Mbps) + RTT(ms) 按 BDP 公式换算成缓冲区大小并调用 bbr_write_conf，
+# 供选项 4（半自动）与选项 5（全自动）共用，避免重复计算逻辑。
+bbr_apply_bdp() {
+    local bw="$1" rtt="$2" desc="$3"
+    local bw_bps bdp_bytes buf_bytes mem_cap
+    bw_bps=$((bw * 1000000))
+    bdp_bytes=$((bw_bps * rtt / 1000 / 8))
+    buf_bytes=$((bdp_bytes * 2))
+    [ "$buf_bytes" -lt 4194304 ] && buf_bytes=4194304
+    # 先按硬性上限 128MB 截断，再用机器内存做安全封顶（小内存机器封顶更低，
+    # 防止 BDP 公式在小内存实例上算出过大的值而挤占可用内存）。
+    [ "$buf_bytes" -gt 134217728 ] && buf_bytes=134217728
+    mem_cap=$(bbr_mem_buffer_cap)
+    if [ "$buf_bytes" -gt "$mem_cap" ]; then
+        yellow "\n按 BDP 公式算出的缓冲区超过本机内存安全上限，已从 $((buf_bytes / 1024 / 1024))MB 封顶至 $((mem_cap / 1024 / 1024))MB\n"
+        buf_bytes="$mem_cap"
+    fi
+    yellow "\nBDP ≈ $((bdp_bytes / 1024 / 1024))MB，取2倍余量，最终缓冲区上限 = $((buf_bytes / 1024 / 1024))MB\n"
+    bbr_write_conf "$buf_bytes" "$desc" "$rtt"
 }
 
 bbr_disable() {
@@ -2679,6 +2797,7 @@ bbr_disable() {
         local ts
         ts=$(date +%Y%m%d%H%M%S)
         mv "$BBR_CONF" "${BBR_CONF}.bak.${ts}"
+        rm -f "$BBR_MODULES_CONF"
         sysctl --system >/dev/null 2>&1
         green "\n已关闭，配置已备份为 ${BBR_CONF}.bak.${ts}\n"
     else
