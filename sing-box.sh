@@ -50,6 +50,19 @@ check_service() {
 check_singbox() { check_service "sing-box" "${work_dir}/sing-box"; }
 check_argo()    { check_service "argo"     "${work_dir}/argo"; }
 
+# ── 安装失败回滚 ───────────────────────────────────
+# install_singbox 中途失败时调用：删除已落盘的 sing-box 二进制，
+# 让 check_singbox 重新返回"未安装"(2)，避免用户卡在"半安装"状态
+# 无法通过菜单重装；同时清理该次安装已放行的 hy2 防火墙规则，
+# 避免留下孤儿规则。
+_install_singbox_rollback() {
+    local hy2_port="${1:-}"
+    rm -f "${work_dir}/sing-box"
+    if [ -n "$hy2_port" ] && [ "$hy2_port" != "null" ]; then
+        remove_port "${hy2_port}/udp" 2>/dev/null
+    fi
+}
+
 # ── 包安装 ────────────────────────────────────────
 install_packages() {
     local to_install=()
@@ -320,13 +333,13 @@ install_singbox() {
     case "$arch_raw" in
         x86_64|amd64)  arch='amd64' ;;
         aarch64|arm64) arch='arm64' ;;
-        *) red "不支持的架构: ${arch_raw}"; exit 1 ;;
+        *) red "不支持的架构: ${arch_raw}"; return 1 ;;
     esac
     
     if ss -tlnH | awk '{print $5}' | grep -q ":${ARGO_PORT}$"; then
         yellow "端口 ${ARGO_PORT} 已被占用，自动选用空闲 TCP 端口"
         local new_argo_port
-        new_argo_port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; exit 1; }
+        new_argo_port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
         ARGO_PORT="$new_argo_port"
         green "VLESS-Argo 端口已切换到 ${ARGO_PORT}"
     fi
@@ -334,8 +347,8 @@ install_singbox() {
     mkdir -p "${work_dir}" "${conf_dir}"
     chmod 700 "${work_dir}"
 
-    download_singbox "$arch" "$sb_ver" "${work_dir}/sing-box" || exit 1
-    download_cloudflared "$arch" "${work_dir}/argo"           || exit 1
+    download_singbox "$arch" "$sb_ver" "${work_dir}/sing-box" || { _install_singbox_rollback; return 1; }
+    download_cloudflared "$arch" "${work_dir}/argo"           || { _install_singbox_rollback; return 1; }
 
     apt-get install -y qrencode 2>/dev/null || yellow "qrencode 安装失败，二维码功能不可用"
 
@@ -375,7 +388,7 @@ install_singbox() {
         else
             if ss -ulnH | awk '{print $5}' | grep -q ":${hy2_port}$"; then
                 yellow "备份中的 Hysteria2 端口 ${hy2_port} 已被占用，将重新分配"
-                hy2_port=$(pick_free_udp_port) || exit 1
+                hy2_port=$(pick_free_udp_port) || { _install_singbox_rollback; return 1; }
             fi
             if ss -tlnH | awk '{print $5}' | grep -q ":${argo_port}$"; then
                 yellow "备份中的 VLESS-Argo 端口 ${argo_port} 已被占用，将使用默认端口 ${ARGO_PORT}"
@@ -386,7 +399,7 @@ install_singbox() {
     fi
 
     if ! $restore_backup; then
-        hy2_port=$(pick_free_udp_port) || exit 1
+        hy2_port=$(pick_free_udp_port) || { _install_singbox_rollback; return 1; }
         uuid=$(cat /proc/sys/kernel/random/uuid)
         vless_path="/${uuid}-vless"
         hy2_password=$(openssl rand -hex 16)
@@ -421,18 +434,18 @@ install_singbox() {
         yellow "正在生成新 TLS 证书..."
         if ! openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" 2>/dev/null; then
             red "生成私钥失败（磁盘空间/权限/OpenSSL异常），已中止"
-            return 1
+            _install_singbox_rollback "$hy2_port"; return 1
         fi
         if ! openssl req -new -x509 -days 3650 \
             -key "${work_dir}/private.key" \
             -out "${work_dir}/cert.pem" \
             -subj "/CN=bing.com" 2>/dev/null; then
             red "生成自签证书失败，已中止"
-            return 1
+            _install_singbox_rollback "$hy2_port"; return 1
         fi
         if [ ! -s "${work_dir}/private.key" ] || [ ! -s "${work_dir}/cert.pem" ]; then
             red "TLS 证书或私钥文件为空，生成异常，已中止"
-            return 1
+            _install_singbox_rollback "$hy2_port"; return 1
         fi
         chmod 600 "${work_dir}/private.key"
     fi
@@ -447,7 +460,7 @@ install_singbox() {
   }
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/ntp.json" << 'EOF'
 {
@@ -459,7 +472,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/dns.json" << 'EOF'
 {
@@ -469,7 +482,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/inbounds.json" << EOF
 {
@@ -511,7 +524,7 @@ EOF
   ]
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/outbounds.json" << 'EOF'
 {
@@ -521,7 +534,7 @@ EOF
   ]
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/route.json" << 'EOF'
 {
@@ -532,7 +545,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     write_json_atomic "${conf_dir}/experimental.json" << EOF
 {
@@ -544,7 +557,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || return 1
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
 
     # ── 恢复 Argo 隧道与 CF 优选配置（若有备份）──
     if $restore_backup; then
@@ -570,6 +583,10 @@ EOF
             cp "${backup_dir}/cf.env" "${work_dir}/cf.env"
             chmod 600 "${work_dir}/cf.env"
         fi
+        # 恢复 autofix 日志，使其在将来"彻底卸载"时仍能定位到被自动
+        # 注释过的系统配置行并恢复；否则这条恢复链路会在这次重装后失效。
+        [ -f "${backup_dir}/bbr-autofix.log" ]  && cp "${backup_dir}/bbr-autofix.log"  "$BBR_AUTOFIX_LOG"
+        [ -f "${backup_dir}/ipv6-autofix.log" ] && cp "${backup_dir}/ipv6-autofix.log" "$IPV6_AUTOFIX_LOG"
 
         # ── 恢复备用协议（TUIC / Reality / AnyTLS）──
         # inbounds.json 是按固定模板重新生成的（不是整体复制备份），
@@ -2405,6 +2422,12 @@ _do_uninstall_core() {
         [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
         [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
         [ -d "${work_dir}/protocol_creds" ]  && cp -r "${work_dir}/protocol_creds" "${backup_dir}/protocol_creds"
+        # autofix 日志记录了"哪个系统文件的哪一行被自动注释过"，必须随节点配置
+        # 一起备份，否则重装后这份日志随 work_dir 一起被删，将来彻底卸载时
+        # restore_autofixed_lines 找不到日志，被自动注释的系统配置行会永久
+        # 恢复不回来。
+        [ -f "$BBR_AUTOFIX_LOG" ]  && cp "$BBR_AUTOFIX_LOG"  "${backup_dir}/bbr-autofix.log"
+        [ -f "$IPV6_AUTOFIX_LOG" ] && cp "$IPV6_AUTOFIX_LOG" "${backup_dir}/ipv6-autofix.log"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
 
         if [ -s "${backup_dir}/inbounds.json" ] && [ -s "${backup_dir}/cert.pem" ]; then
@@ -2871,6 +2894,24 @@ net.ipv4.tcp_orphan_retries = 3
 net.ipv4.tcp_max_tw_buckets = 6000
 net.ipv4.tcp_mtu_probing = 1
 EOF
+    else
+        # 非激进场景也显式写回内核默认值：如果这台机器之前跑过老版本脚本
+        # 或激进场景，这些参数已经被改过，仅仅"配置文件里不写"不会让内核
+        # 恢复默认——sysctl --system 只应用文件里存在的键，未写的键维持
+        # 现状。这里显式写回标准 Linux 默认值使其真正复位。
+        # tcp_max_tw_buckets 的内核默认值随内存大小变化、无统一常量，这里
+        # 不做重置；如此前应用过激进场景，请重启使其恢复内核自动计算的
+        # 默认值。
+        cat >> "$BBR_CONF" << EOF
+
+# ── 显式重置为内核默认值（避免此前激进场景/旧版本脚本的残留）──
+net.ipv4.tcp_fin_timeout = 60
+net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_syn_retries = 6
+net.ipv4.tcp_synack_retries = 5
+net.ipv4.tcp_orphan_retries = 0
+net.ipv4.tcp_mtu_probing = 0
+EOF
     fi
     sysctl --system >/dev/null 2>&1
     # 先做一次自动冲突消除：只要 BBR_CONF 里写的参数和实际生效值不一致，
@@ -3311,6 +3352,7 @@ EOF
                 [ "$f" = "/etc/sysctl.d/99-disable-ipv6.conf" ] && continue
                 [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
                 grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null || continue
+                rm -f "${f}.bak."[0-9]*
                 cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
                 local ipv6_ln
                 while IFS=: read -r ipv6_ln; do
@@ -3576,7 +3618,7 @@ do_install() {
     TUNNEL_TOKEN_MODE=false
     ARGO_TOKEN_RESTORED=false
 
-    install_packages jq openssl curl || { red "基础依赖安装失败，请检查网络或软件源"; exit 1; }
+    install_packages jq openssl curl || { red "基础依赖安装失败，请检查网络或软件源"; return 1; }
 
     yellow "正在查询 sing-box 最新版本…"
     local install_ver
