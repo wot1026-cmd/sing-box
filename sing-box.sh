@@ -2628,6 +2628,42 @@ bbr_mem_buffer_cap() {
     fi
 }
 
+# 只处理"BBR_CONF 里实际写了、且生效值跟 BBR_CONF 不一致"的那些参数键，
+# 不做模糊关键词匹配 —— 避免像 bbr_clean 那样误伤 conntrack、端口范围等无关配置。
+# 静默执行、自动备份后注释，不需要用户确认，供 bbr_write_conf 在写完配置后立即调用。
+bbr_autofix_conflicts() {
+    local conf="$1" key val actual line fixed_any=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        key=$(echo "$line" | sed -E 's/^([^=]+)=.*/\1/' | xargs)
+        val=$(echo "$line" | sed -E 's/^[^=]+=(.*)$/\1/' | xargs)
+        [ -z "$key" ] && continue
+        actual=$(sysctl -n "$key" 2>/dev/null | xargs)
+        [ -z "$actual" ] && continue          # 内核不支持这个参数，跳过
+        [ "$actual" = "$val" ] && continue    # 生效值已经和期望一致，无需处理
+
+        # 生效值不一致，说明有别的文件在覆盖 —— 逐个文件检查是否定义了这个 key
+        # 且值不同，是的话注释掉那一行（跳过 BBR_CONF 自己和历史备份文件）。
+        local f
+        for f in /etc/sysctl.d/*.conf /etc/sysctl.conf /usr/lib/sysctl.d/*.conf; do
+            [ -f "$f" ] || continue
+            [ "$f" = "$conf" ] && continue
+            [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
+            grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$f" 2>/dev/null || continue
+            local backup="${f}.bak.$(date +%Y%m%d%H%M%S)"
+            cp "$f" "$backup"
+            sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
+            fixed_any=1
+        done
+    done < <(grep -E '^net\.|^kernel\.|^vm\.|^fs\.' "$conf" 2>/dev/null)
+
+    if [ "$fixed_any" = 1 ]; then
+        sysctl --system >/dev/null 2>&1
+        yellow "检测到其他配置文件覆盖了本次调优参数，已自动注释冲突行并重新加载（原文件已备份为 .bak.时间戳）\n"
+    fi
+}
+
 bbr_write_conf() {
     # $1 = rmem/wmem 上限字节数, $2 = 场景描述文字, $3 = RTT毫秒（可选，用于 notsent_lowat 分档，默认150）
     local buf="$1" desc="$2" rtt="${3:-150}" notsent_lowat
@@ -2687,6 +2723,10 @@ net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 EOF
     sysctl --system >/dev/null 2>&1
+    # 先做一次自动冲突消除：只要 BBR_CONF 里写的参数和实际生效值不一致，
+    # 说明别的文件在覆盖它（sysctl.d 内按文件名排序、sysctl.conf 最后加载），
+    # 自动定位到那些文件里的对应行、备份后注释掉，不需要用户再手动跑扫描/清理。
+    bbr_autofix_conflicts "$BBR_CONF"
     local cc qdisc rmem
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -3040,8 +3080,12 @@ setup_firewall_base() {
     fi
 
     # ── 1. 禁用 IPv6（内核层，使用 sysctl.d 覆盖云厂商配置）──
-    if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
-        yellow "检测到未禁用 IPv6，正在禁用…"
+    local disable_ipv6_choice
+    reading "是否禁用 IPv6？多数代理场景建议禁用，避免流量走 IPv6 路径导致连接异常 (Y/n): " disable_ipv6_choice
+    if [[ ! "$disable_ipv6_choice" =~ ^[nN]$ ]]; then
+        if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
+            yellow "检测到未禁用 IPv6，正在禁用…"
+        fi
         cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
 # 禁用 IPv6（sing-box 脚本添加）
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -3050,11 +3094,35 @@ net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
         sysctl --system &>/dev/null
 
-        # 验证是否真的禁用
+        # 验证是否真的禁用；不一致说明有其他文件（云厂商镜像自带的 ipv6.conf 等）
+        # 在 99-disable-ipv6.conf 之后加载、把值又覆盖回去了，自动定位并注释掉那些行，
+        # 不能只打印警告了事 —— 之前就出现过 all/default/lo 全部显示 0 但用户毫无察觉的情况。
         if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
             green "IPv6 已在内核层禁用"
         else
-            yellow "警告：IPv6 禁用可能未生效，请检查 /etc/sysctl.d/ 下是否有冲突配置"
+            yellow "检测到 IPv6 禁用被其他配置文件覆盖，正在自动排查…"
+            local ipv6_key ipv6_fixed=0
+            for ipv6_key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
+                [ "$(sysctl -n "$ipv6_key" 2>/dev/null)" = "1" ] && continue
+                local f
+                for f in /etc/sysctl.d/*.conf /etc/sysctl.conf /usr/lib/sysctl.d/*.conf; do
+                    [ -f "$f" ] || continue
+                    [ "$f" = "/etc/sysctl.d/99-disable-ipv6.conf" ] && continue
+                    [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
+                    grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null || continue
+                    cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+                    sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${ipv6_key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
+                    ipv6_fixed=1
+                done
+            done
+            if [ "$ipv6_fixed" = 1 ]; then
+                sysctl --system &>/dev/null
+            fi
+            if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
+                green "已自动清理冲突配置，IPv6 现已在内核层禁用（原文件已备份为 .bak.时间戳）"
+            else
+                red "自动清理后 IPv6 仍未成功禁用，请手动检查 /etc/sysctl.d/ 下的相关文件"
+            fi
         fi
 
         # sshd 只监听 IPv4（reload 不断当前连接）
@@ -3069,6 +3137,8 @@ EOF
                 sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
             fi
         fi
+    else
+        purple "已跳过 IPv6 禁用，保持当前状态"
     fi
 
     # ── 2. IPv6 防火墙：直接全 DROP，无需维护具体规则 ──
