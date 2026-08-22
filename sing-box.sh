@@ -15,7 +15,7 @@ green()  { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue(){ echo -e "\e[1;36m$1\033[0m"; }
-reading(){ read -p "$(red "$1")" "$2"; }
+reading(){ read -p "$(red "$1")" "$2" || exit 1; }
 
 # ── 常量 ──────────────────────────────────────────
 work_dir="/etc/sing-box"
@@ -965,6 +965,8 @@ change_config() {
             ;;
 
        2)
+            local old_port
+            old_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "$inbounds_file")
             reading "\n请输入新的 Hysteria2 端口（回车随机生成）: " new_port
             if [ -z "$new_port" ]; then
                 new_port=$(pick_free_udp_port)
@@ -972,12 +974,12 @@ change_config() {
                 if ! [[ "$new_port" =~ ^[1-9][0-9]*$ ]] || (( new_port < 1 || new_port > 65535 )); then
                     red "端口无效（1-65535，不含前导零）"; sleep 1; return 0
                 fi
-                if ss -ulnH | awk '{print $5}' | grep -q ":${new_port}$"; then
+                # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
+                # 确认/改回原端口会被自己服务正在监听的端口挡住
+                if [ "$new_port" != "$old_port" ] && ss -ulnH | awk '{print $5}' | grep -q ":${new_port}$"; then
                     red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
                 fi
             fi
-            local old_port
-            old_port=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "$inbounds_file")
             local tmp_file
             tmp_file=$(mktemp)
             jq --argjson p "$new_port" \
@@ -989,7 +991,7 @@ change_config() {
             mv "$tmp_file" "$inbounds_file"
             # 用统一的 remove_port/allow_port（而非手动摘 DROP 再插回），
             # 天然兼容 ufw 场景，且自带持久化，避免和防火墙状态不一致
-            if [ -n "$old_port" ] && [ "$old_port" != "null" ]; then
+            if [ -n "$old_port" ] && [ "$old_port" != "null" ] && [ "$old_port" != "$new_port" ]; then
                 remove_port "${old_port}/udp"
             fi
             allow_port "${new_port}/udp"
@@ -1003,20 +1005,28 @@ change_config() {
             fi
             ;;
         3)
+            local old_port
+            old_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws") | .listen_port' "$inbounds_file")
             reading "\n请输入新的 VLESS-Argo 端口（回车随机生成）: " new_port
             [ -z "$new_port" ] && new_port=$(pick_free_tcp_port)
             if ! [[ "$new_port" =~ ^[1-9][0-9]*$ ]] || (( new_port < 1 || new_port > 65535 )); then
                 red "端口无效（1-65535，不含前导零）"; sleep 1; return 0
             fi
-            if ss -tlnH | awk '{print $5}' | grep -q ":${new_port}$"; then
+            # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
+            # 确认/改回原端口会被自己服务正在监听的端口挡住
+            if [ "$new_port" != "$old_port" ] && ss -tlnH | awk '{print $5}' | grep -q ":${new_port}$"; then
                 red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
             fi
 
             # Token 模式下，本地端口和 Cloudflare Dashboard 后端配置是分离的，
             # sed 无法同步修改 Dashboard 侧配置，必须用户手动去 Dashboard 改，
-            # 因此这里在写入配置前先强制确认，避免节点静默失效
+            # 因此这里在写入配置前先强制确认，避免节点静默失效。
+            # 判断逻辑改为跟 _rebuild_argo_service_from_tunnel_yml 一致的语义判断
+            # （tunnel.yml 是否含 credentials-file 字段），不再依赖文件是否存在——
+            # 后者会被模式切换后残留的旧凭据文件（如切了 JSON 模式但 argo_token
+            # 没删）误导，导致误判成 Token 模式或漏判。
             local is_token_mode=false
-            if [ -f "${work_dir}/tunnel.yml" ] && [ -f "${work_dir}/argo_token" ] && [ ! -f "${work_dir}/tunnel.json" ]; then
+            if [ -f "${work_dir}/tunnel.yml" ] && ! grep -q '^credentials-file:' "${work_dir}/tunnel.yml" 2>/dev/null; then
                 is_token_mode=true
             fi
 
@@ -1414,9 +1424,12 @@ _ensure_acme_sync_cron() {
     local domain="$1"
 
     # 1) 续期检查任务：整个 --home 目录级别只需注册一次，覆盖该目录下所有域名
+    #    两条 cron 命令都加了 [ -d work_dir ] || exit 0 守卫：keep 模式卸载会保留
+    #    这两条 cron（供重装后继续用），但 rm -rf work_dir 之后如果用户不重装，
+    #    没有这个守卫的话，cron 会永久每天报错（acme.sh 二进制、--home 目录都已不存在）。
     local renew_marker="# sing-box-extra-protocols acme renew-check"
     if ! crontab -l 2>/dev/null | grep -qF "$renew_marker"; then
-        local renew_cmd="'${_acme_sh_bin}' --cron --home '${work_dir}/.acme.sh' >>'${work_dir}/acme.log' 2>&1"
+        local renew_cmd="[ -d '${work_dir}' ] || exit 0; '${_acme_sh_bin}' --cron --home '${work_dir}/.acme.sh' >>'${work_dir}/acme.log' 2>&1"
         (crontab -l 2>/dev/null; echo "33 3 * * * ${renew_cmd} ${renew_marker}") | crontab -
     fi
 
@@ -1426,7 +1439,7 @@ _ensure_acme_sync_cron() {
         return 0
     fi
     local cert_dir="${work_dir}/acme/${domain}"
-    local sync_cmd="CF_Token=\$(grep '^CF_ACME_TOKEN=' '${work_dir}/cf.env' | cut -d'=' -f2-) CF_Zone_ID=\$(grep '^CF_ACME_ZONE_ID=' '${work_dir}/cf.env' | cut -d'=' -f2-) '${_acme_sh_bin}' --install-cert -d '${domain}' --home '${work_dir}/.acme.sh' --key-file '${cert_dir}/key.pem' --fullchain-file '${cert_dir}/cert.pem' --reloadcmd true >>'${work_dir}/acme.log' 2>&1"
+    local sync_cmd="[ -d '${work_dir}' ] || exit 0; CF_Token=\$(grep '^CF_ACME_TOKEN=' '${work_dir}/cf.env' | cut -d'=' -f2-) CF_Zone_ID=\$(grep '^CF_ACME_ZONE_ID=' '${work_dir}/cf.env' | cut -d'=' -f2-) '${_acme_sh_bin}' --install-cert -d '${domain}' --home '${work_dir}/.acme.sh' --key-file '${cert_dir}/key.pem' --fullchain-file '${cert_dir}/cert.pem' --reloadcmd true >>'${work_dir}/acme.log' 2>&1"
     (crontab -l 2>/dev/null; echo "17 4 * * * ${sync_cmd} ${sync_marker}") | crontab -
 }
 
@@ -2072,11 +2085,13 @@ upgrade_singbox() {
     local tmp_dest
     tmp_dest=$(mktemp)
     if ! download_singbox "$arch" "$latest_ver" "$tmp_dest"; then
+        rm -f "$tmp_dest"
         red "下载失败，请检查网络"
         return 0
     fi
 
     if ! stop_singbox; then
+        rm -f "$tmp_dest"
         red "sing-box 停止失败，已取消升级（服务可能处于异常状态，请先检查：journalctl -u sing-box -n 50 --no-pager）"
         return 0
     fi
@@ -2115,6 +2130,10 @@ upgrade_singbox() {
 # ── 配置固定 Argo 隧道 ────────────────────────────
 configure_fixed_tunnel() {
     clear
+    if ! command_exists jq; then
+        red "缺少依赖 jq，无法解析 JSON 凭据，请先安装 sing-box（会自动装好 jq）或手动安装 jq"
+        return 0
+    fi
     yellow "\n固定隧道支持 JSON 凭据或 Token 两种方式"
     yellow "JSON 获取：https://fscarmen.cloudflare.now.cc\n"
 
@@ -2135,6 +2154,10 @@ configure_fixed_tunnel() {
     yellow "当前 VLESS 端口: ${current_argo_port}\n"
 
     if [[ "$argo_auth" =~ TunnelSecret ]]; then
+        # 写入 JSON 模式前先清掉 Token 模式可能残留的 argo_token，避免
+        # change_config 等处依赖"文件是否存在"判断模式时被旧文件误导，
+        # 导致以为还是 Token 模式、走错分支（改端口静默失效等问题）。
+        rm -f "${work_dir}/argo_token"
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         chmod 600 "${work_dir}/tunnel.json"
         local tunnel_id
@@ -2174,6 +2197,8 @@ WantedBy=multi-user.target
 EOF
 
     elif [[ "$argo_auth" =~ ^[A-Za-z0-9+/=._-]{100,500}$ ]]; then
+        # 写入 Token 模式前先清掉 JSON 模式可能残留的 tunnel.json，理由同上。
+        rm -f "${work_dir}/tunnel.json"
         printf '# token mode\nhostname: %s\n' "$argo_domain" > "${work_dir}/tunnel.yml"
         echo "$argo_auth" > "${work_dir}/argo_token"
         chmod 600 "${work_dir}/argo_token"
@@ -2310,10 +2335,13 @@ _do_uninstall_core() {
         # 彻底卸载时同时恢复安装脚本对系统层做过的改动，语义是"恢复原状"：
         # - 禁用 IPv6 的 sysctl 配置
         # - BBR 调优 sysctl 配置
+        # - initcwnd/initrwnd 调优（独立的 systemd service + 脚本，不在 sysctl.d 里，
+        #   之前漏了这一步，导致"彻底卸载"后 initcwnd 32 依然每次开机生效）
         # - sshd 限制为仅监听 IPv4（AddressFamily inet）
         # 以及安装/配置过程中残留的 .bak.* 备份文件
         rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
         rm -f /etc/sysctl.d/*.bak.* /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
+        bbr_remove_initcwnd
         if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
             sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
             if sshd -t 2>/dev/null; then
@@ -2384,7 +2412,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "${work_dir}/sb.sh" << EOF
 #!/usr/bin/env bash
-bash <(curl -fsSL ${SCRIPT_URL}) \$1
+bash <(curl -fsSL ${SCRIPT_URL}) "\$@"
 EOF
     chmod +x "${work_dir}/sb.sh"
     ln -sf "${work_dir}/sb.sh" /usr/bin/sb
@@ -2430,15 +2458,15 @@ manage_fail2ban() {
             1)
                 install_packages fail2ban || { red "安装失败"; return 0; }
 
-                local ssh_port
-                ssh_port=$(ss -tlnpH 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | head -1)
-                [ -z "$ssh_port" ] && ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
-                [ -z "$ssh_port" ] && ssh_port=22
+                local ssh_ports
+                ssh_ports=$(ss -tlnpH 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, -)
+                [ -z "$ssh_ports" ] && ssh_ports=$(grep -E '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | sort -un | paste -sd, -)
+                [ -z "$ssh_ports" ] && ssh_ports=22
 
                 cat > /etc/fail2ban/jail.local << EOF
 [sshd]
 enabled  = true
-port     = ${ssh_port}
+port     = ${ssh_ports}
 backend  = systemd
 maxretry = 5
 bantime  = 3600
@@ -2447,7 +2475,7 @@ EOF
                 systemctl enable fail2ban
                 systemctl restart fail2ban
                 if systemctl is-active fail2ban &>/dev/null; then
-                    green "\nfail2ban 已启用，正在保护 SSH 端口 ${ssh_port}\n"
+                    green "\nfail2ban 已启用，正在保护 SSH 端口 ${ssh_ports}\n"
                 else
                     red "\nfail2ban 启动失败，请检查日志: journalctl -u fail2ban\n"
                 fi
@@ -3091,9 +3119,10 @@ setup_firewall_base() {
     fi
 
     # ── 1. 禁用 IPv6（内核层，使用 sysctl.d 覆盖云厂商配置）──
-    local disable_ipv6_choice
+    local disable_ipv6_choice ipv6_disabled=false
     reading "是否禁用 IPv6？多数代理场景建议禁用，避免流量走 IPv6 路径导致连接异常 (Y/n): " disable_ipv6_choice
     if [[ ! "$disable_ipv6_choice" =~ ^[nN]$ ]]; then
+        ipv6_disabled=true
         if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
             yellow "检测到未禁用 IPv6，正在禁用…"
         fi
@@ -3152,11 +3181,30 @@ EOF
         purple "已跳过 IPv6 禁用，保持当前状态"
     fi
 
-    # ── 2. IPv6 防火墙：直接全 DROP，无需维护具体规则 ──
+    # ── 2. IPv6 防火墙 ──
+    # 用户选择禁用 IPv6 时，内核层已经不会收发 v6 流量，全部 DROP 无副作用；
+    # 用户选择保留 IPv6 时，如果这里仍然全 DROP，会导致：出站连接的 v6 回包被丢
+    # （没放行 ESTABLISHED/RELATED）、NDP 邻居发现被丢（没放行 ICMPv6），
+    # 结果是 IPv6 内核层没禁、但实际完全不可用 —— 跟用户"保留 IPv6"的选择自相矛盾。
+    # 所以保留 IPv6 时额外放行 ESTABLISHED/RELATED 和 NDP 必需的 ICMPv6 类型，
+    # 让 IPv6 在 DROP 兜底之下仍然可用。
     ip6tables -P INPUT ACCEPT 2>/dev/null || true
     ip6tables -F INPUT 2>/dev/null || true
     ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    if [ "$ipv6_disabled" = false ]; then
+        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        # NDP（邻居发现/路由通告等）依赖这几种 ICMPv6 类型，缺了任何一种
+        # IPv6 网关可达性、地址自动配置都会出问题
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type router-solicitation      -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type router-advertisement     -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-solicitation    -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-advertisement   -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type packet-too-big           -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type time-exceeded            -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT -p icmpv6 --icmpv6-type destination-unreachable  -j ACCEPT 2>/dev/null || true
+    fi
     ip6tables -A INPUT -j DROP 2>/dev/null || true
+
 
     # ── 3. 清空 IPv4 INPUT 链，重建 ──
     iptables -P INPUT ACCEPT 2>/dev/null || true
@@ -3182,17 +3230,21 @@ EOF
     iptables -A INPUT -p icmp --icmp-type time-exceeded -j ACCEPT 2>/dev/null || true
     iptables -A INPUT -p icmp -j DROP 2>/dev/null || true
 
-    # ── 8. 放行 SSH 端口（优先 sshd_config，兜底 ss 探测）──
-    local ssh_port
-    ssh_port=$(grep -E '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null \
-        | awk '{print $2}' | head -1)
-    [ -z "$ssh_port" ] && ssh_port=$(ss -tlnpH 2>/dev/null \
-        | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | sort -u | head -1)
-    if [ -z "$ssh_port" ]; then
-        ssh_port=22
+    # ── 8. 放行 SSH 端口（优先 sshd_config，兜底 ss 探测；sshd 可能配置多个 Port，全部放行）──
+    local ssh_ports
+    ssh_ports=$(grep -E '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null \
+        | awk '{print $2}' | sort -un)
+    [ -z "$ssh_ports" ] && ssh_ports=$(ss -tlnpH 2>/dev/null \
+        | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | sort -un)
+    if [ -z "$ssh_ports" ]; then
+        ssh_ports=22
         yellow "警告：未检测到 sshd 监听端口，默认放行 22"
     fi
-    iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT 2>/dev/null || true
+    local _ssh_port
+    while IFS= read -r _ssh_port; do
+        [ -z "$_ssh_port" ] && continue
+        iptables -A INPUT -p tcp --dport "$_ssh_port" -j ACCEPT 2>/dev/null || true
+    done <<< "$ssh_ports"
 
     # ── 9. 放行 hy2 端口 ──
     local hy2_port_reapply
@@ -3271,14 +3323,25 @@ EOF
         echo ""
         yellow "检测到以下端口有进程监听但未在防火墙放行，逐一确认是否放行："
         for entry in "${unknown_ports[@]}"; do
-            local p_port p_proto p_proc reply
+            local p_port p_proto p_proc reply tty_ok=false
             p_port=$(echo "$entry"  | cut -d'|' -f1)
             p_proto=$(echo "$entry" | cut -d'|' -f2)
             p_proc=$(echo "$entry"  | cut -d'|' -f3)
             echo ""
             skyblue "  端口：${p_port}/${p_proto}  进程：${p_proc}"
             printf "  是否放行？[Y/n] "
-            read -r reply </dev/tty
+            # 没有可用的 /dev/tty（如 docker exec 无终端）或 read 失败（EOF）时，
+            # 强制按"拒绝"处理，不能落进下面 [Y/n] 的默认分支——那样等于把
+            # "默认拒绝未知端口"的设计意图变成了"没有终端就自动全部放行"。
+            # 真正拿到用户输入时（哪怕直接回车留空），仍按提示语标注的
+            # [Y/n]（回车默认放行）来走，不改变正常交互体验。
+            if [ -r /dev/tty ] && read -r reply </dev/tty; then
+                tty_ok=true
+            fi
+            if ! $tty_ok; then
+                yellow "  无法读取终端输入，按默认拒绝处理，跳过 ${p_port}/${p_proto}"
+                continue
+            fi
             case "$reply" in
                 [Nn]*) yellow "  跳过 ${p_port}/${p_proto}" ;;
                 *)     ports_to_allow+=("${p_port}|${p_proto}") ;;
@@ -3547,7 +3610,7 @@ case "$1" in
                 0) exit 0 ;;
                 *) red "无效选项，请输入 0-14" ;;
             esac
-            [ "$need_pause" = true ] && read -n1 -s -r -p $'\033[1;91m按任意键返回…\033[0m'
+            [ "$need_pause" = true ] && { read -n1 -s -r -p $'\033[1;91m按任意键返回…\033[0m' || exit 0; }
             echo ""
         done
         ;;
