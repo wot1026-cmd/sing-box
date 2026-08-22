@@ -1,5 +1,5 @@
 # 自动同步自 kelee.one
-# 更新时间: 2026-08-21 03:00:05
+# 更新时间: 2026-08-22 03:00:04
 # 插件: BlockAdvertisers
 # 模式: filter
 
@@ -826,6 +826,9 @@ rules:
     policy: REJECT
 - domain_suffix:
     match: adjust.com
+    policy: REJECT
+- domain_suffix:
+    match: adjust.io
     policy: REJECT
 - domain_suffix:
     match: adjust.net.in
