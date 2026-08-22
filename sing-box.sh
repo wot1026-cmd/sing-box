@@ -1516,7 +1516,6 @@ add_protocol_tuic() {
     fi
 
     local port uuid password
-    local reused=false
     if _ask_reuse_creds tuic "TUIC v5"; then
         local old_json
         old_json=$(_read_protocol_creds tuic)
@@ -1536,7 +1535,6 @@ add_protocol_tuic() {
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
             fi
-            reused=true
             green "已复用 TUIC 旧配置（UUID/密码不变，客户端链接可能仅端口变化）"
         fi
     else
