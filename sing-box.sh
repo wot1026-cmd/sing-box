@@ -2633,6 +2633,11 @@ bbr_mem_buffer_cap() {
 # 静默执行、自动备份后注释，不需要用户确认，供 bbr_write_conf 在写完配置后立即调用。
 bbr_autofix_conflicts() {
     local conf="$1" key val actual line fixed_any=0
+    # 同一次调用里，同一个文件只在第一次要修改它时备份一次（备份的是这次自动清理
+    # 开始前的最初状态），本次调用中对同一文件的后续注释不再重复备份，避免同一
+    # 文件在一轮处理里产生多份"中间状态"备份。用一个以换行分隔的字符串记录本次
+    # 已经备份过的文件路径（bash 3 兼容写法，不依赖关联数组）。
+    local backed_up_files=$'\n'
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
@@ -2651,8 +2656,14 @@ bbr_autofix_conflicts() {
             [ "$f" = "$conf" ] && continue
             [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
             grep -qE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$f" 2>/dev/null || continue
-            local backup="${f}.bak.$(date +%Y%m%d%H%M%S)"
-            cp "$f" "$backup"
+            if [[ "$backed_up_files" != *$'\n'"$f"$'\n'* ]]; then
+                # 本次调用中这是第一次动这个文件：先清掉它自己之前遗留的旧备份，
+                # 只保留"这次清理开始前"这一份最新备份，避免反复切换场景时
+                # .bak.时间戳 文件无限累积。
+                rm -f "${f}.bak."[0-9]*
+                cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+                backed_up_files="${backed_up_files}${f}"$'\n'
+            fi
             sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
             fixed_any=1
         done
@@ -2660,7 +2671,7 @@ bbr_autofix_conflicts() {
 
     if [ "$fixed_any" = 1 ]; then
         sysctl --system >/dev/null 2>&1
-        yellow "检测到其他配置文件覆盖了本次调优参数，已自动注释冲突行并重新加载（原文件已备份为 .bak.时间戳）\n"
+        yellow "检测到其他配置文件覆盖了本次调优参数，已自动注释冲突行并重新加载（原文件已备份为 .bak.时间戳，仅保留最新一份）\n"
     fi
 }
 
