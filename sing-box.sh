@@ -2442,6 +2442,7 @@ _do_uninstall_core() {
         rm -f /etc/sysctl.d/*.bak.* /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
         bbr_remove_initcwnd
         bbr_restore_autofixed_lines
+        restore_autofixed_lines "$IPV6_AUTOFIX_LOG"
         if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
             sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
             if sshd -t 2>/dev/null; then
@@ -2650,7 +2651,11 @@ BBR_INITCWND_UNIT="/etc/systemd/system/wot-initcwnd.service"
 BBR_INITCWND_SCRIPT="/usr/local/sbin/wot-initcwnd.sh"
 # 记录 bbr_autofix_conflicts 自动注释过哪些文件的哪一行（每行格式：文件路径<TAB>行号），
 # 关闭调优时据此把这些行原样恢复，而不是只删掉自己的配置文件了事。
+# 注意：只记 BBR 自己触发的注释。IPv6 清理有自己独立的 IPV6_AUTOFIX_LOG——两者共用
+# 一份日志会导致"BBR 从没启用过就直接 return"时，IPv6 那部分记录永远没人来恢复。
 BBR_AUTOFIX_LOG="/etc/sing-box/bbr-autofix.log"
+# IPv6 自动清理冲突配置时的恢复日志，跟 BBR 的完全独立，卸载时单独调用恢复。
+IPV6_AUTOFIX_LOG="/etc/sing-box/ipv6-autofix.log"
 
 # initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
 # 必须用 ip route 单独设置。作用：新连接建立时首波无需等 ACK 就能发送的包数，
@@ -2974,11 +2979,13 @@ bbr_apply_menu() {
     esac
 }
 
-bbr_restore_autofixed_lines() {
-    # 把 bbr_autofix_conflicts / IPv6 自动清理时注释掉的那些行，原样恢复。
+restore_autofixed_lines() {
+    # 通用版：把某份 autofix 日志里记录的、自动注释掉的行原样恢复。
+    # $1 = 日志文件路径（BBR_AUTOFIX_LOG 或 IPV6_AUTOFIX_LOG）。
     # 按"文件+行号"精确定位，只去掉本脚本加的注释前缀，不影响文件里其他内容
     # （不用 .bak 整份回滚，因为 .bak 之后用户可能又手动改过该文件的其他部分）。
-    [ -f "$BBR_AUTOFIX_LOG" ] || return 0
+    local log="$1"
+    [ -f "$log" ] || return 0
     local file line restored=0
     while IFS=$'\t' read -r file line; do
         [ -z "$file" ] && continue
@@ -2989,12 +2996,16 @@ bbr_restore_autofixed_lines() {
             sed -i "${line}s|^\([[:space:]]*\)# \[由sing-box\.sh\(自动清理\|注释\)\] |\1|" "$file"
             restored=1
         fi
-    done < "$BBR_AUTOFIX_LOG"
+    done < "$log"
     if [ "$restored" = 1 ]; then
         sysctl --system >/dev/null 2>&1
         yellow "已恢复此前被自动注释的其他配置文件中的原始设置\n"
     fi
-    rm -f "$BBR_AUTOFIX_LOG"
+    rm -f "$log"
+}
+
+bbr_restore_autofixed_lines() {
+    restore_autofixed_lines "$BBR_AUTOFIX_LOG"
 }
 
 bbr_disable() {
@@ -3312,103 +3323,85 @@ setup_firewall_base() {
     fi
 
     # ── 1. 禁用 IPv6（内核层，使用 sysctl.d 覆盖云厂商配置）──
-    local disable_ipv6_choice ipv6_disabled=false
-    reading "是否禁用 IPv6？多数代理场景建议禁用，避免流量走 IPv6 路径导致连接异常 (Y/n): " disable_ipv6_choice
-    if [[ ! "$disable_ipv6_choice" =~ ^[nN]$ ]]; then
-        ipv6_disabled=true
-        if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
-            yellow "检测到未禁用 IPv6，正在禁用…"
-        fi
-        cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
+    # 本脚本按 IPv4 VPS 场景设计，防火墙/端口放行等逻辑都只按 IPv4 实现，
+    # 不提供"保留 IPv6"选项——之前尝试同时支持两种模式时，保留分支的 IPv6
+    # 入站服务实际上仍会被防火墙挡住（SSH/Hy2/TUIC等端口只在IPv4放行），
+    # 半吊子支持反而比直接禁用更容易让人误判。直接禁用，行为单一、可预期。
+    yellow "本脚本按 IPv4 VPS 场景设计，正在禁用 IPv6…"
+    if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
+        yellow "检测到未禁用 IPv6，正在禁用…"
+    fi
+    cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
 # 禁用 IPv6（sing-box 脚本添加）
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-        sysctl --system &>/dev/null
+    sysctl --system &>/dev/null
 
-        # 验证是否真的禁用；不一致说明有其他文件（云厂商镜像自带的 ipv6.conf 等）
-        # 在 99-disable-ipv6.conf 之后加载、把值又覆盖回去了，自动定位并注释掉那些行，
-        # 不能只打印警告了事 —— 之前就出现过 all/default/lo 全部显示 0 但用户毫无察觉的情况。
-        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
-            green "IPv6 已在内核层禁用"
-        else
-            yellow "检测到 IPv6 禁用被其他配置文件覆盖，正在自动排查…"
-            local ipv6_key ipv6_fixed=0
-            for ipv6_key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
-                [ "$(sysctl -n "$ipv6_key" 2>/dev/null)" = "1" ] && continue
-                local f
-                for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
-                    [ -f "$f" ] || continue
-                    [ "$f" = "/etc/sysctl.d/99-disable-ipv6.conf" ] && continue
-                    [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
-                    grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null || continue
-                    cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
-                    local ipv6_ln
-                    while IFS=: read -r ipv6_ln; do
-                        [ -z "$ipv6_ln" ] && continue
-                        mkdir -p "$(dirname "$BBR_AUTOFIX_LOG")" 2>/dev/null
-                        printf '%s\t%s\n' "$f" "$ipv6_ln" >> "$BBR_AUTOFIX_LOG"
-                    done < <(grep -nE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | cut -d: -f1)
-                    sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${ipv6_key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
-                    ipv6_fixed=1
-                done
-                # /usr/lib/sysctl.d/ 属于系统包管理范围，不直接修改，只提示。
-                local libf
-                for libf in /usr/lib/sysctl.d/*.conf; do
-                    [ -f "$libf" ] || continue
-                    grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$libf" 2>/dev/null || continue
-                    yellow "提示：${libf}（系统/厂商配置）中也将 ${ipv6_key} 设为 0，脚本不会修改该文件。"
-                done
-            done
-            if [ "$ipv6_fixed" = 1 ]; then
-                sysctl --system &>/dev/null
-            fi
-            if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
-                green "已自动清理冲突配置，IPv6 现已在内核层禁用（原文件已备份为 .bak.时间戳）"
-            else
-                red "自动清理后 IPv6 仍未成功禁用，请手动检查 /etc/sysctl.d/ 下的相关文件"
-            fi
-        fi
-
-        # sshd 只监听 IPv4（reload 不断当前连接）
-        if ! grep -q "^AddressFamily inet" /etc/ssh/sshd_config; then
-            sed -i '/^AddressFamily/d' /etc/ssh/sshd_config
-            echo "AddressFamily inet" >> /etc/ssh/sshd_config
-            if sshd -t 2>/dev/null; then
-                systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-                green "sshd 已设置为仅监听 IPv4（reload）"
-            else
-                yellow "sshd 配置测试失败，回滚 AddressFamily 设置"
-                sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
-            fi
-        fi
+    # 验证是否真的禁用；不一致说明有其他文件（云厂商镜像自带的 ipv6.conf 等）
+    # 在 99-disable-ipv6.conf 之后加载、把值又覆盖回去了，自动定位并注释掉那些行，
+    # 不能只打印警告了事 —— 之前就出现过 all/default/lo 全部显示 0 但用户毫无察觉的情况。
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
+        green "IPv6 已在内核层禁用"
     else
-        purple "已跳过 IPv6 禁用，保持当前状态"
+        yellow "检测到 IPv6 禁用被其他配置文件覆盖，正在自动排查…"
+        local ipv6_key ipv6_fixed=0
+        for ipv6_key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
+            [ "$(sysctl -n "$ipv6_key" 2>/dev/null)" = "1" ] && continue
+            local f
+            for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+                [ -f "$f" ] || continue
+                [ "$f" = "/etc/sysctl.d/99-disable-ipv6.conf" ] && continue
+                [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
+                grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null || continue
+                cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+                local ipv6_ln
+                while IFS=: read -r ipv6_ln; do
+                    [ -z "$ipv6_ln" ] && continue
+                    mkdir -p "$(dirname "$IPV6_AUTOFIX_LOG")" 2>/dev/null
+                    printf '%s\t%s\n' "$f" "$ipv6_ln" >> "$IPV6_AUTOFIX_LOG"
+                done < <(grep -nE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | cut -d: -f1)
+                sed -i -E "/^[[:space:]]*#/! s|^([[:space:]]*${ipv6_key//./\\.}[[:space:]]*=.*)\$|# [由sing-box.sh自动清理] \1|" "$f"
+                ipv6_fixed=1
+            done
+            # /usr/lib/sysctl.d/ 属于系统包管理范围，不直接修改，只提示。
+            local libf
+            for libf in /usr/lib/sysctl.d/*.conf; do
+                [ -f "$libf" ] || continue
+                grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$libf" 2>/dev/null || continue
+                yellow "提示：${libf}（系统/厂商配置）中也将 ${ipv6_key} 设为 0，脚本不会修改该文件。"
+            done
+        done
+        if [ "$ipv6_fixed" = 1 ]; then
+            sysctl --system &>/dev/null
+        fi
+        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
+            green "已自动清理冲突配置，IPv6 现已在内核层禁用（原文件已备份为 .bak.时间戳）"
+        else
+            red "自动清理后 IPv6 仍未成功禁用，请手动检查 /etc/sysctl.d/ 下的相关文件"
+        fi
+    fi
+
+    # sshd 只监听 IPv4（reload 不断当前连接）
+    if ! grep -q "^AddressFamily inet" /etc/ssh/sshd_config; then
+        sed -i '/^AddressFamily/d' /etc/ssh/sshd_config
+        echo "AddressFamily inet" >> /etc/ssh/sshd_config
+        if sshd -t 2>/dev/null; then
+            systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+            green "sshd 已设置为仅监听 IPv4（reload）"
+        else
+            yellow "sshd 配置测试失败，回滚 AddressFamily 设置"
+            sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
+        fi
     fi
 
     # ── 2. IPv6 防火墙 ──
-    # 用户选择禁用 IPv6 时，内核层已经不会收发 v6 流量，全部 DROP 无副作用；
-    # 用户选择保留 IPv6 时，如果这里仍然全 DROP，会导致：出站连接的 v6 回包被丢
-    # （没放行 ESTABLISHED/RELATED）、NDP 邻居发现被丢（没放行 ICMPv6），
-    # 结果是 IPv6 内核层没禁、但实际完全不可用 —— 跟用户"保留 IPv6"的选择自相矛盾。
-    # 所以保留 IPv6 时额外放行 ESTABLISHED/RELATED 和 NDP 必需的 ICMPv6 类型，
-    # 让 IPv6 在 DROP 兜底之下仍然可用。
+    # IPv6 已在上一步禁用，内核层不会再收发 v6 流量，这里直接全 DROP 无副作用，
+    # 不需要像之前"保留IPv6"分支那样额外放行 ESTABLISHED/RELATED、NDP 等。
     ip6tables -P INPUT ACCEPT 2>/dev/null || true
     ip6tables -F INPUT 2>/dev/null || true
     ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
-    if [ "$ipv6_disabled" = false ]; then
-        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        # NDP（邻居发现/路由通告等）依赖这几种 ICMPv6 类型，缺了任何一种
-        # IPv6 网关可达性、地址自动配置都会出问题
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type router-solicitation      -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type router-advertisement     -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-solicitation    -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-advertisement   -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type packet-too-big           -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type time-exceeded            -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p icmpv6 --icmpv6-type destination-unreachable  -j ACCEPT 2>/dev/null || true
-    fi
     ip6tables -A INPUT -j DROP 2>/dev/null || true
 
 
