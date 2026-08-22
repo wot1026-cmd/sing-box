@@ -2518,18 +2518,89 @@ EOF
 # ── BBR 网络调优管理 ──────────────────────────────────
 BBR_CONF="/etc/sysctl.d/99-wot-proxy-tuning.conf"
 BBR_KEYWORDS='tcp_|rmem|wmem|conntrack|congestion_control|qdisc'
+BBR_INITCWND_UNIT="/etc/systemd/system/wot-initcwnd.service"
+BBR_INITCWND_SCRIPT="/usr/local/sbin/wot-initcwnd.sh"
+
+# initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
+# 必须用 ip route 单独设置。作用：新连接建立时首波无需等 ACK 就能发送的包数，
+# 内核默认约 10（≈14.6KB）。调到 32（≈46.7KB）能让"打开网页/切换应用"这类短连接
+# 的首屏数据更可能一次发完，少等一个 RTT —— 到高延迟节点（150-200ms+）时这个提速
+# 是能感知到的；对追求跑满带宽的大文件/长连接场景则没有实际收益。
+# 只在带宽较低（≤100Mbps）的链路上需要谨慎：首波突发有概率打穿限速器/令牌桶，
+# 反而引发首秒重传。100Mbps 以上机器一般不必担心。
+#
+# 路由重启会重置，所以要单独做持久化：写一个开机跑的 systemd 服务，
+# 每次开机现查网关和网卡（不能写死 IP，网关地址可能变），失败也不报错中断开机流程。
+bbr_apply_initcwnd() {
+    local gw iface
+    gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+    iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    if [ -z "$gw" ] || [ -z "$iface" ]; then
+        yellow "未找到默认路由网关，跳过 initcwnd 设置\n"
+        return 1
+    fi
+    if ! ip route replace default via "$gw" dev "$iface" initcwnd 32 initrwnd 32 2>/dev/null; then
+        yellow "initcwnd 设置失败（部分虚拟化平台不支持），跳过\n"
+        return 1
+    fi
+    cat > "$BBR_INITCWND_SCRIPT" << 'EOF'
+#!/bin/bash
+# 由 sing-box.sh 网络调优模块生成，开机时重新应用 initcwnd/initrwnd
+GW=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+IF=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+[ -n "$GW" ] && [ -n "$IF" ] && ip route replace default via "$GW" dev "$IF" initcwnd 32 initrwnd 32
+exit 0
+EOF
+    chmod +x "$BBR_INITCWND_SCRIPT"
+    cat > "$BBR_INITCWND_UNIT" << EOF
+[Unit]
+Description=wot-proxy initcwnd/initrwnd tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${BBR_INITCWND_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable --now wot-initcwnd.service >/dev/null 2>&1
+    return 0
+}
+
+bbr_remove_initcwnd() {
+    local gw iface
+    gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+    iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    systemctl disable --now wot-initcwnd.service >/dev/null 2>&1
+    rm -f "$BBR_INITCWND_UNIT" "$BBR_INITCWND_SCRIPT"
+    systemctl daemon-reload >/dev/null 2>&1
+    # 尝试把路由恢复成不带 initcwnd/initrwnd 的状态（去掉持久化即可防止开机重设，
+    # 这里额外把当前运行时的路由也顺手清掉，避免用户不重启就一直带着旧值）。
+    if [ -n "$gw" ] && [ -n "$iface" ]; then
+        ip route replace default via "$gw" dev "$iface" 2>/dev/null
+    fi
+}
 
 bbr_get_status() {
-    local cc qdisc
+    local cc qdisc initcwnd_state
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if ip route show default 2>/dev/null | grep -q 'initcwnd 32'; then
+        initcwnd_state="initcwnd=32"
+    else
+        initcwnd_state="initcwnd=默认"
+    fi
     if [ -f "$BBR_CONF" ]; then
         local scenario
         scenario=$(grep -m1 "^# 场景:" "$BBR_CONF" 2>/dev/null | sed 's/^# 场景: *//')
         if [ -n "$scenario" ]; then
-            echo "本脚本调优: 已启用 (${cc} + ${qdisc})，当前场景: ${scenario}"
+            echo "本脚本调优: 已启用 (${cc} + ${qdisc} + ${initcwnd_state})，当前场景: ${scenario}"
         else
-            echo "本脚本调优: 已启用 (${cc} + ${qdisc})"
+            echo "本脚本调优: 已启用 (${cc} + ${qdisc} + ${initcwnd_state})"
         fi
     elif [ "$cc" = "bbr" ]; then
         echo "本脚本调优: 未启用，但检测到其他来源已开启 BBR (${cc} + ${qdisc})"
@@ -2625,6 +2696,9 @@ EOF
     else
         red "\n配置已写入，但验证异常 (拥塞控制=${cc}, 队列=${qdisc}, 缓冲区=${rmem}，期望值=${buf})\n请检查是否有其他文件覆盖了此设置（可用「扫描冲突配置」查看）\n"
     fi
+    if bbr_apply_initcwnd; then
+        green "initcwnd/initrwnd: 32（已设置并持久化，短连接首屏更快）\n"
+    fi
     return 0
 }
 
@@ -2686,6 +2760,7 @@ bbr_disable() {
         ts=$(date +%Y%m%d%H%M%S)
         mv "$BBR_CONF" "${BBR_CONF}.bak.${ts}"
         sysctl --system >/dev/null 2>&1
+        bbr_remove_initcwnd
         green "\n已关闭，配置已备份为 ${BBR_CONF}.bak.${ts}\n"
     else
         purple "已取消"
