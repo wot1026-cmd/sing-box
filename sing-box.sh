@@ -2846,7 +2846,7 @@ EOF
 
 # ── 进阶参数（改变TCP默认超时/重试/MTU行为）──
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_orphan_retries = 3
@@ -3006,6 +3006,7 @@ bbr_scan() {
     green "=== 扫描现有配置中的网络调优相关设置 ===\n"
     yellow "(只读，不会做任何修改)\n"
 
+    declare -gA BBR_SCAN_FILES=()
     local files
     files=$(grep -rlE "$BBR_KEYWORDS" /etc/sysctl.d/ /etc/sysctl.conf /usr/lib/sysctl.d/ 2>/dev/null)
     if [ -z "$files" ]; then
@@ -3014,7 +3015,6 @@ bbr_scan() {
     fi
 
     local idx=0
-    declare -gA BBR_SCAN_FILES=()
     for f in $files; do
         idx=$((idx + 1))
         BBR_SCAN_FILES[$idx]="$f"
