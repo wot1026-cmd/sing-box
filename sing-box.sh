@@ -2260,7 +2260,7 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
 
-    elif [[ "$argo_auth" =~ ^[A-Za-z0-9+/=._-]{100,500}$ ]]; then
+    elif [[ "$argo_auth" =~ ^[A-Za-z0-9+/=._-]{30,500}$ ]]; then
         # 写入 Token 模式前先清掉 JSON 模式可能残留的 tunnel.json，理由同上。
         rm -f "${work_dir}/tunnel.json"
         printf '# token mode\nhostname: %s\n' "$argo_domain" > "${work_dir}/tunnel.yml"
@@ -3435,7 +3435,7 @@ EOF
     local unknown_ports=()
     local addr port proto proc already dup_key is_dup existing
     while IFS= read -r line; do
-        addr=$(echo "$line"  | awk '{print $5}')
+        addr=$(echo "$line"  | awk '{print $4}')
         port=$(echo "$addr"  | grep -oE '[0-9]+$')
         proto=$(echo "$line" | awk '{print $1}' | sed 's/6$//')
         proc=$(echo "$line"  | grep -oE 'users:\(\("[^"]+' \
