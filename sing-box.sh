@@ -263,6 +263,15 @@ write_json_atomic() {
         rm -f "$tmp"
         return 1
     fi
+    # 注意：真实 jq 对完全空的输入，`jq empty` 会因为一次都没有解析到值、
+    # 也就一次都没有报错而返回 0（并非"空输入=非法"）。所以必须先单独判断
+    # 是否为空文件，不能只靠 jq empty，否则上游 jq 因文件损坏/过滤器出错
+    # 而输出空流时，会被当作"合法"写入，把目标文件清空。
+    if [ ! -s "$tmp" ]; then
+        red "生成的 JSON 内容为空，未写入：${dest}"
+        rm -f "$tmp"
+        return 1
+    fi
     if ! jq empty "$tmp" 2>/dev/null; then
         red "生成的 JSON 格式非法，未写入：${dest}"
         rm -f "$tmp"
@@ -276,13 +285,20 @@ write_json_atomic() {
     return 0
 }
 
+# 检测端口是否已被占用
+# 用法：_port_in_use <port> <tcp|udp>  返回 0 = 已占用，1 = 空闲
+_port_in_use() {
+    local port="$1" proto="$2" flag
+    [ "$proto" = udp ] && flag=-ulnH || flag=-tlnH
+    ss "$flag" 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"
+}
+
 # ── 查找未被占用的端口 ────────────────────────────
 # 用法：pick_free_port udp|tcp
 pick_free_port() {
-    local proto="$1" flag port attempts=0
-    [ "$proto" = udp ] && flag=-ulnH || flag=-tlnH
+    local proto="$1" port attempts=0
     port=$(shuf -i 10000-65000 -n 1)
-    while ss "$flag" | awk '{print $4}' | grep -q ":${port}$"; do
+    while _port_in_use "$port" "$proto"; do
         port=$(shuf -i 10000-65000 -n 1)
         (( attempts++ > 100 )) && { echo "无法找到空闲 ${proto^^} 端口" >&2; return 1; }
     done
@@ -300,7 +316,7 @@ install_singbox() {
 
     local arch
     arch=$(detect_arch) || return 1
-    if ss -tlnH | awk '{print $4}' | grep -q ":${ARGO_PORT}$"; then
+    if _port_in_use "$ARGO_PORT" tcp; then
         yellow "端口 ${ARGO_PORT} 已被占用，自动选用空闲 TCP 端口"
         local new_argo_port
         new_argo_port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
@@ -350,11 +366,11 @@ install_singbox() {
             yellow "备份配置内容异常，已忽略备份，将生成全新配置"
             restore_backup=false
         else
-            if ss -ulnH | awk '{print $4}' | grep -q ":${hy2_port}$"; then
+            if _port_in_use "$hy2_port" udp; then
                 yellow "备份中的 Hysteria2 端口 ${hy2_port} 已被占用，将重新分配"
                 hy2_port=$(pick_free_udp_port) || { _install_singbox_rollback; return 1; }
             fi
-            if ss -tlnH | awk '{print $4}' | grep -q ":${argo_port}$"; then
+            if _port_in_use "$argo_port" tcp; then
                 yellow "备份中的 VLESS-Argo 端口 ${argo_port} 已被占用，将使用默认端口 ${ARGO_PORT}"
                 argo_port="${ARGO_PORT}"
             fi
@@ -574,8 +590,7 @@ EOF
 
                 _ep_port=$(jq -r '.listen_port' <<< "$_ep_inbound")
                 case "$_ep_tag" in tuic) _ep_proto="udp" ;; *) _ep_proto="tcp" ;; esac
-                if { [ "$_ep_proto" = udp ] && ss -ulnH | awk '{print $4}' | grep -q ":${_ep_port}$"; } \
-                   || { [ "$_ep_proto" = tcp ] && ss -tlnH | awk '{print $4}' | grep -q ":${_ep_port}$"; }; then
+                if _port_in_use "$_ep_port" "$_ep_proto"; then
                     yellow "备份中 ${_ep_tag} 端口 ${_ep_port} 已被占用，跳过恢复该协议（可安装后手动重新添加）"
                     continue
                 fi
@@ -916,9 +931,7 @@ cn_block_manage() {
             if $block_enabled; then
                 yellow "大陆拦截已开启，无需重复操作\n"; sleep 1; return 1
             fi
-            local tmp_file
-            tmp_file=$(mktemp)
-            jq '
+            if ! jq '
               del(.route.rules[] | select(.rule_set[]? == "geosite-cn")) |
               del(.route.rules[] | select(
                   .domain_regex? and .outbound == "direct" and
@@ -936,11 +949,9 @@ cn_block_manage() {
                  "outbound":"direct"},
                 {"rule_set":["geosite-cn"],"outbound":"block"}
               ] + .route.rules
-            ' "$route_file" > "$tmp_file"
-            if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
+            ' "$route_file" | write_json_atomic "$route_file"; then
+                red "配置写入失败"; sleep 2; return 0
             fi
-            mv "$tmp_file" "$route_file"
             if restart_singbox; then
                 green "\n大陆域名拦截已开启\n"
             else
@@ -952,20 +963,16 @@ cn_block_manage() {
             if ! $block_enabled; then
                 yellow "大陆拦截未开启\n"; sleep 1; return 1
             fi
-            local tmp_file
-            tmp_file=$(mktemp)
-            jq '
+            if ! jq '
               del(.route.rules[] | select(.rule_set[]? == "geosite-cn")) |
               del(.route.rules[] | select(
                   .domain_regex? and .outbound == "direct" and
                   (.domain_regex[] | test("googleapis"))
               )) |
               del(.route.rule_set[] | select(.tag == "geosite-cn"))
-            ' "$route_file" > "$tmp_file"
-            if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 2; return 0
+            ' "$route_file" | write_json_atomic "$route_file"; then
+                red "配置写入失败"; sleep 2; return 0
             fi
-            mv "$tmp_file" "$route_file"
             if restart_singbox; then
                 green "\n大陆域名拦截已关闭\n"
             else
@@ -1004,17 +1011,13 @@ change_config() {
                ! [[ "$new_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
                 red "UUID 格式不合法"; sleep 1; return 0
             fi
-            local tmp_file
-            tmp_file=$(mktemp)
             # 仅修改 Argo VLESS 的 UUID 和 path（按 tag 精确匹配，避免误改 Reality 的 vless inbound）
-            jq --arg u "$new_uuid" --arg p "/${new_uuid}-vless" '
+            if ! jq --arg u "$new_uuid" --arg p "/${new_uuid}-vless" '
                 (.inbounds[] | select(.tag=="vless-ws") | .users[] | .uuid) = $u |
                 (.inbounds[] | select(.tag=="vless-ws") | .transport.path) = $p
-            ' "$inbounds_file" > "$tmp_file"
-            if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置文件写入失败，请检查！"; sleep 2; return 0
+            ' "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                red "配置文件写入失败，请检查！"; sleep 2; return 0
             fi
-            mv "$tmp_file" "$inbounds_file"
             if restart_singbox; then
                 get_info
                 green "\nUUID 已修改为：${new_uuid}\n"
@@ -1036,19 +1039,15 @@ change_config() {
                 fi
                 # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
                 # 确认/改回原端口会被自己服务正在监听的端口挡住
-                if [ "$new_port" != "$old_port" ] && ss -ulnH | awk '{print $4}' | grep -q ":${new_port}$"; then
+                if [ "$new_port" != "$old_port" ] && _port_in_use "$new_port" udp; then
                     red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
                 fi
             fi
-            local tmp_file
-            tmp_file=$(mktemp)
-            jq --argjson p "$new_port" \
+            if ! jq --argjson p "$new_port" \
                 '(.inbounds[] | select(.type=="hysteria2") | .listen_port) = $p' \
-                "$inbounds_file" > "$tmp_file"
-            if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return 0
+                "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                red "配置写入失败"; sleep 1; return 0
             fi
-            mv "$tmp_file" "$inbounds_file"
             # 用统一的 remove_port/allow_port（而非手动摘 DROP 再插回），
             # 天然兼容 ufw 场景，且自带持久化，避免和防火墙状态不一致
             if [ -n "$old_port" ] && [ "$old_port" != "null" ] && [ "$old_port" != "$new_port" ]; then
@@ -1074,7 +1073,7 @@ change_config() {
             fi
             # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
             # 确认/改回原端口会被自己服务正在监听的端口挡住
-            if [ "$new_port" != "$old_port" ] && ss -tlnH | awk '{print $4}' | grep -q ":${new_port}$"; then
+            if [ "$new_port" != "$old_port" ] && _port_in_use "$new_port" tcp; then
                 red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
             fi
 
@@ -1101,15 +1100,11 @@ change_config() {
                 fi
             fi
 
-            local tmp_file
-            tmp_file=$(mktemp)
-            jq --argjson p "$new_port" \
+            if ! jq --argjson p "$new_port" \
                 '(.inbounds[] | select(.tag=="vless-ws") | .listen_port) = $p' \
-                "$inbounds_file" > "$tmp_file"
-            if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
-                rm -f "$tmp_file"; red "配置写入失败"; sleep 1; return 0
+                "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                red "配置写入失败"; sleep 1; return 0
             fi
-            mv "$tmp_file" "$inbounds_file"
 
             if [ -f "${work_dir}/tunnel.yml" ]; then
                 if $is_token_mode; then
@@ -1213,15 +1208,19 @@ _mark_protocol_installed() {
     is_protocol_installed "$tag" || echo "$tag" >> "$protocols_list"
 }
 
+# 从文件里删除与给定字符串完全匹配的行（原子写入，mktemp 失败则静默跳过）
+# 用法：_remove_line_from_file <file> <line>
+_remove_line_from_file() {
+    local file="$1" line="$2" tmp
+    tmp=$(mktemp) || return 1
+    grep -vxF "$line" "$file" > "$tmp" 2>/dev/null
+    mv "$tmp" "$file"
+}
+
 _mark_protocol_removed() {
     local tag="$1"
     _ensure_protocols_list
-    local tmp
-    tmp=$(mktemp)
-    if [ -n "$tmp" ]; then
-        grep -vxF "$tag" "$protocols_list" > "$tmp" 2>/dev/null
-        mv "$tmp" "$protocols_list"
-    fi
+    _remove_line_from_file "$protocols_list" "$tag"
 }
 
 # ── inbounds.json 读写工具（复用主脚本 jq 风格） ──
@@ -1234,28 +1233,14 @@ _inbound_exists() {
 _add_inbound_json() {
     # $1 = 新 inbound 的 JSON 字符串
     local new_inbound="$1"
-    local tmp
-    tmp=$(mktemp)
     jq --argjson nb "$new_inbound" '.inbounds += [$nb]' \
-        "${conf_dir}/inbounds.json" > "$tmp"
-    if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
-        rm -f "$tmp"
-        return 1
-    fi
-    mv "$tmp" "${conf_dir}/inbounds.json"
+        "${conf_dir}/inbounds.json" | write_json_atomic "${conf_dir}/inbounds.json"
 }
 
 _remove_inbound_json() {
     local tag="$1"
-    local tmp
-    tmp=$(mktemp)
     jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' \
-        "${conf_dir}/inbounds.json" > "$tmp"
-    if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
-        rm -f "$tmp"
-        return 1
-    fi
-    mv "$tmp" "${conf_dir}/inbounds.json"
+        "${conf_dir}/inbounds.json" | write_json_atomic "${conf_dir}/inbounds.json"
 }
 
 # ── Reality 密钥对：生成一次、持久化，重装时复用 ──
@@ -1571,6 +1556,33 @@ _creds_field_valid() {
 }
 
 # =========================================================
+# _resolve_protocol_cert：TUIC/AnyTLS 等协议共用的证书获取逻辑
+# 优先 acme.sh 申请真实证书；申请失败或未配置则回退复用现有自签 cert.pem / private.key
+# 用法：acme_domain=$(_resolve_protocol_cert)
+#   返回 0 → acme 可用，标准输出为证书域名
+#   返回 1 → 回退使用自签证书（标准输出为空）
+#   返回 2 → 两者都不可用，调用方应报错并 return 1
+# =========================================================
+_resolve_protocol_cert() {
+    local acme_domain
+    if ensure_acme_config; then
+        acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
+        # 先在装 inbound 之前就把证书申请完，申请失败直接中止，
+        # 不会出现"配置已写入但 sing-box 启动时才发现证书拿不到"导致服务崩溃重启的情况
+        # （2026-08 DediRock 曾因此触发 Let's Encrypt 限流，参见脚本内相关记录）。
+        if _acme_sh_issue_cert "$acme_domain"; then
+            echo "$acme_domain"
+            return 0
+        fi
+        yellow "acme 证书申请失败，回退使用自签证书" >&2
+    fi
+    if [ -f "${work_dir}/cert.pem" ] && [ -f "${work_dir}/private.key" ]; then
+        return 1
+    fi
+    return 2
+}
+
+# =========================================================
 # add_protocol_tuic：生成 TUIC v5 inbound
 # 优先 acme.sh 申请真实证书；否则回退复用现有自签 cert.pem / private.key
 # =========================================================
@@ -1581,21 +1593,12 @@ add_protocol_tuic() {
     fi
 
     local use_acme=false acme_domain
-    if ensure_acme_config; then
-        acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
-        # 先在装 inbound 之前就把证书申请完，申请失败直接中止，
-        # 不会出现"配置已写入但 sing-box 启动时才发现证书拿不到"导致服务崩溃重启的情况
-        # （2026-08 DediRock 曾因此触发 Let's Encrypt 限流，参见脚本内相关记录）。
-        if _acme_sh_issue_cert "$acme_domain"; then
-            use_acme=true
-        else
-            yellow "acme 证书申请失败，回退使用自签证书"
-        fi
-    fi
-    if ! $use_acme && { [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; }; then
-        red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
-        return 1
-    fi
+    acme_domain=$(_resolve_protocol_cert)
+    case $? in
+        0) use_acme=true ;;
+        1) : ;;
+        *) red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"; return 1 ;;
+    esac
 
     local port uuid password
     if _ask_reuse_creds tuic "TUIC v5"; then
@@ -1613,7 +1616,7 @@ add_protocol_tuic() {
             password=$(openssl rand -hex 16)
         else
             # 旧端口若已被占用（比如期间装了别的服务），自动换新端口，不阻塞流程
-            if ss -ulnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+            if _port_in_use "$port" udp; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
             fi
@@ -1711,7 +1714,7 @@ add_protocol_reality() {
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             uuid=$(cat /proc/sys/kernel/random/uuid)
         else
-            if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+            if _port_in_use "$port" tcp; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             fi
@@ -1770,19 +1773,13 @@ add_protocol_anytls() {
     fi
 
     local use_acme=false acme_domain
-    if ensure_acme_config; then
-        acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
-        # 同 TUIC：先申请证书，成功了再生成 inbound，避免证书问题拖垮整个服务
-        if _acme_sh_issue_cert "$acme_domain"; then
-            use_acme=true
-        else
-            yellow "acme 证书申请失败，回退使用自签证书"
-        fi
-    fi
-    if ! $use_acme && { [ ! -f "${work_dir}/cert.pem" ] || [ ! -f "${work_dir}/private.key" ]; }; then
-        red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"
-        return 1
-    fi
+    # 同 TUIC：先申请证书，成功了再生成 inbound，避免证书问题拖垮整个服务
+    acme_domain=$(_resolve_protocol_cert)
+    case $? in
+        0) use_acme=true ;;
+        1) : ;;
+        *) red "未找到证书文件，请先安装 sing-box 主体（VLESS+Hysteria2）"; return 1 ;;
+    esac
 
     local port password
     if _ask_reuse_creds anytls "AnyTLS"; then
@@ -1795,7 +1792,7 @@ add_protocol_anytls() {
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             password=$(openssl rand -hex 16)
         else
-            if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+            if _port_in_use "$port" tcp; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             fi
@@ -1888,12 +1885,7 @@ remove_protocol() {
     local _removed_acme_domain=""
     if [ -f "${work_dir}/protocols_acme.list" ] && grep -qxF "$tag" "${work_dir}/protocols_acme.list"; then
         _removed_acme_domain="$acme_domain"
-        local _tmp
-        _tmp=$(mktemp)
-        if [ -n "$_tmp" ]; then
-            grep -vxF "$tag" "${work_dir}/protocols_acme.list" > "$_tmp" 2>/dev/null
-            mv "$_tmp" "${work_dir}/protocols_acme.list"
-        fi
+        _remove_line_from_file "${work_dir}/protocols_acme.list" "$tag"
     fi
 
     # 若该域名不再被任何已装协议使用，清理对应的证书同步 cron 任务，避免残留垃圾任务
@@ -3623,9 +3615,7 @@ do_install() {
     fi
 # 默认开启大陆域名拦截
     local route_file="${conf_dir}/route.json"
-    local tmp_file
-    tmp_file=$(mktemp)
-    jq '
+    if jq '
       .route.rule_set += [{"type":"remote","tag":"geosite-cn","format":"binary",
         "url":"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
         "download_detour":"direct"}] |
@@ -3637,16 +3627,13 @@ do_install() {
          "outbound":"direct"},
         {"rule_set":["geosite-cn"],"outbound":"block"}
       ] + .route.rules
-    ' "$route_file" > "$tmp_file"
-    if [ $? -eq 0 ] && [ -s "$tmp_file" ] && jq empty "$tmp_file" 2>/dev/null; then
-        mv "$tmp_file" "$route_file"
+    ' "$route_file" | write_json_atomic "$route_file"; then
         if restart_singbox; then
             green "大陆域名拦截已默认开启"
         else
             yellow "大陆域名拦截规则已写入，但 sing-box 重启失败，可能未生效（不影响后续流程，可稍后手动检查）"
         fi
     else
-        rm -f "$tmp_file"
         yellow "大陆域名拦截配置失败，已跳过（不影响核心功能）"
     fi
     setup_firewall_base
