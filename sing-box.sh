@@ -36,6 +36,18 @@ command -v systemctl >/dev/null 2>&1 || { red "本脚本仅支持 systemd 系统
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ── 架构检测 ──────────────────────────────────────
+# 用法：detect_arch  →  echo 出 amd64/arm64，失败时打印错误并 return 1
+detect_arch() {
+    local arch_raw
+    arch_raw=$(uname -m)
+    case "$arch_raw" in
+        x86_64|amd64)  echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) red "不支持的架构: ${arch_raw}"; return 1 ;;
+    esac
+}
+
 # ── crontab 安全删行 ──────────────────────────────
 # 用法：_crontab_remove_matching <匹配模式>
 # 直接用 `crontab -l | grep -v ... | crontab -` 有风险：crontab -l 一旦因瞬时异常
@@ -100,6 +112,34 @@ install_packages() {
     done
 }
 
+# ── 持久化 iptables/ip6tables 规则到磁盘 ──────────
+# 用法：_persist_iptables_rules <has_iptables:0|1> <has_ip6tables:0|1>
+_persist_iptables_rules() {
+    local has_iptables="$1" has_ip6tables="$2"
+    if [ "$has_iptables" -eq 1 ] && command_exists iptables-save; then
+        mkdir -p /etc/iptables
+        local _tmp4
+        _tmp4=$(mktemp 2>/dev/null)
+        if [ -n "$_tmp4" ] && iptables-save > "$_tmp4" 2>/dev/null; then
+            mv "$_tmp4" /etc/iptables/rules.v4
+        else
+            rm -f "$_tmp4"
+            yellow "保存 rules.v4 失败"
+        fi
+    fi
+    if [ "$has_ip6tables" -eq 1 ] && command_exists ip6tables-save; then
+        mkdir -p /etc/iptables
+        local _tmp6
+        _tmp6=$(mktemp 2>/dev/null)
+        if [ -n "$_tmp6" ] && ip6tables-save > "$_tmp6" 2>/dev/null; then
+            mv "$_tmp6" /etc/iptables/rules.v6
+        else
+            rm -f "$_tmp6"
+            yellow "保存 rules.v6 失败"
+        fi
+    fi
+}
+
 # ── 防火墙放行 ────────────────────────────────────
 allow_port() {
     local has_ufw=0 has_iptables=0 has_ip6tables=0
@@ -122,28 +162,7 @@ allow_port() {
         fi
     done
 
-    if [ $has_iptables -eq 1 ] && command_exists iptables-save; then
-        mkdir -p /etc/iptables
-        local _tmp4
-        _tmp4=$(mktemp 2>/dev/null)
-        if [ -n "$_tmp4" ] && iptables-save > "$_tmp4" 2>/dev/null; then
-            mv "$_tmp4" /etc/iptables/rules.v4
-        else
-            rm -f "$_tmp4"
-            yellow "保存 rules.v4 失败"
-        fi
-    fi
-    if [ $has_ip6tables -eq 1 ] && command_exists ip6tables-save; then
-        mkdir -p /etc/iptables
-        local _tmp6
-        _tmp6=$(mktemp 2>/dev/null)
-        if [ -n "$_tmp6" ] && ip6tables-save > "$_tmp6" 2>/dev/null; then
-            mv "$_tmp6" /etc/iptables/rules.v6
-        else
-            rm -f "$_tmp6"
-            yellow "保存 rules.v6 失败"
-        fi
-    fi
+    _persist_iptables_rules "$has_iptables" "$has_ip6tables"
 }
 
 # ── 防火墙删除旧规则 ──────────────────────────────
@@ -164,28 +183,7 @@ remove_port() {
         fi
     done
 
-    if [ $has_iptables -eq 1 ] && command_exists iptables-save; then
-        mkdir -p /etc/iptables
-        local _tmp4
-        _tmp4=$(mktemp 2>/dev/null)
-        if [ -n "$_tmp4" ] && iptables-save > "$_tmp4" 2>/dev/null; then
-            mv "$_tmp4" /etc/iptables/rules.v4
-        else
-            rm -f "$_tmp4"
-            yellow "保存 rules.v4 失败"
-        fi
-    fi
-    if [ $has_ip6tables -eq 1 ] && command_exists ip6tables-save; then
-        mkdir -p /etc/iptables
-        local _tmp6
-        _tmp6=$(mktemp 2>/dev/null)
-        if [ -n "$_tmp6" ] && ip6tables-save > "$_tmp6" 2>/dev/null; then
-            mv "$_tmp6" /etc/iptables/rules.v6
-        else
-            rm -f "$_tmp6"
-            yellow "保存 rules.v6 失败"
-        fi
-    fi
+    _persist_iptables_rules "$has_iptables" "$has_ip6tables"
 }
 
 # ── 节点名称 ──────────────────────────────────────
@@ -278,26 +276,20 @@ write_json_atomic() {
     return 0
 }
 
-# ── 查找未被占用的 UDP 端口 ───────────────────────
-pick_free_udp_port() {
-    local port attempts=0
+# ── 查找未被占用的端口 ────────────────────────────
+# 用法：pick_free_port udp|tcp
+pick_free_port() {
+    local proto="$1" flag port attempts=0
+    [ "$proto" = udp ] && flag=-ulnH || flag=-tlnH
     port=$(shuf -i 10000-65000 -n 1)
-    while ss -ulnH | awk '{print $5}' | grep -q ":${port}$"; do
+    while ss "$flag" | awk '{print $5}' | grep -q ":${port}$"; do
         port=$(shuf -i 10000-65000 -n 1)
-        (( attempts++ > 100 )) && { echo "无法找到空闲 UDP 端口" >&2; return 1; }
+        (( attempts++ > 100 )) && { echo "无法找到空闲 ${proto^^} 端口" >&2; return 1; }
     done
     echo "$port"
 }
-# ── 查找未被占用的 TCP 端口 ───────────────────────
-pick_free_tcp_port() {
-    local port attempts=0
-    port=$(shuf -i 10000-65000 -n 1)
-    while ss -tlnH | awk '{print $5}' | grep -q ":${port}$"; do
-        port=$(shuf -i 10000-65000 -n 1)
-        (( attempts++ > 100 )) && { echo "无法找到空闲 TCP 端口" >&2; return 1; }
-    done
-    echo "$port"
-}
+pick_free_udp_port() { pick_free_port udp; }
+pick_free_tcp_port() { pick_free_port tcp; }
 
 # ── 安装核心 ──────────────────────────────────────
 install_singbox() {
@@ -306,14 +298,8 @@ install_singbox() {
 
     local sb_ver="${1:-$SB_VERSION}"
 
-    local arch_raw arch
-    arch_raw=$(uname -m)
-    case "$arch_raw" in
-        x86_64|amd64)  arch='amd64' ;;
-        aarch64|arm64) arch='arm64' ;;
-        *) red "不支持的架构: ${arch_raw}"; return 1 ;;
-    esac
-    
+    local arch
+    arch=$(detect_arch) || return 1
     if ss -tlnH | awk '{print $5}' | grep -q ":${ARGO_PORT}$"; then
         yellow "端口 ${ARGO_PORT} 已被占用，自动选用空闲 TCP 端口"
         local new_argo_port
@@ -2134,13 +2120,8 @@ upgrade_singbox() {
     check_singbox &>/dev/null
     [ $? -eq 2 ] && { yellow "sing-box 尚未安装！"; sleep 1; return 0; }
 
-    local arch_raw arch
-    arch_raw=$(uname -m)
-    case "$arch_raw" in
-        x86_64|amd64)  arch='amd64' ;;
-        aarch64|arm64) arch='arm64' ;;
-        *) red "不支持的架构: ${arch_raw}"; return 0 ;;
-    esac
+    local arch
+    arch=$(detect_arch) || return 0
 
     local current_ver
     current_ver=$("${work_dir}/sing-box" version 2>/dev/null \
