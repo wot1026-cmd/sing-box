@@ -229,23 +229,6 @@ download_singbox() {
     curl -fsSLo "$tmp_tar" "${base_url}/${tarball}" \
         || { red "sing-box 下载失败"; rm -f "$tmp_tar"; rm -rf "$tmp_dir"; return 1; }
 
-    # 用 GitHub Releases API 的 asset digest 校验 SHA256，API 失败只警告不阻断
-    local expected_sha remote_sha
-    expected_sha=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${version}" 2>/dev/null \
-        | jq -r --arg name "$tarball" '.assets[] | select(.name == $name) | .digest // empty' 2>/dev/null \
-        | sed 's/^sha256://')
-    if [ -n "$expected_sha" ]; then
-        remote_sha=$(sha256sum "$tmp_tar" | awk '{print $1}')
-        if [ "$expected_sha" != "$remote_sha" ]; then
-            red "sing-box 下载文件 SHA256 校验失败（期望 ${expected_sha}，实际 ${remote_sha}），可能被篡改或下载不完整，已中止"
-            rm -f "$tmp_tar"; rm -rf "$tmp_dir"
-            return 1
-        fi
-        green "SHA256 校验通过"
-    else
-        yellow "警告：未能从 GitHub API 获取该文件的官方 SHA256（可能是限流），跳过校验，请自行确认下载来源可信"
-    fi
-
     tar -xzf "$tmp_tar" -C "$tmp_dir" \
         || { red "解压失败"; rm -f "$tmp_tar"; rm -rf "$tmp_dir"; return 1; }
     mv "${tmp_dir}/sing-box-${version}-linux-${arch}/sing-box" "$dest" \
@@ -266,28 +249,6 @@ download_cloudflared() {
     yellow "正在下载 cloudflared..."
     curl -fsSLo "$tmp_file" "${base_url}/${bin_name}" \
         || { red "cloudflared 下载失败"; rm -f "$tmp_file"; return 1; }
-
-    # 先解析出实际 release tag，再查该 asset 的 SHA256 做校验
-    local resolved_url latest_tag expected_sha remote_sha
-    resolved_url=$(curl -fsSLo /dev/null -w '%{url_effective}' \
-        "https://github.com/cloudflare/cloudflared/releases/latest" 2>/dev/null)
-    latest_tag=$(echo "$resolved_url" | grep -oE '[^/]+$')
-    if [ -n "$latest_tag" ]; then
-        expected_sha=$(curl -fsSL "https://api.github.com/repos/cloudflare/cloudflared/releases/tags/${latest_tag}" 2>/dev/null \
-            | jq -r --arg name "$bin_name" '.assets[] | select(.name == $name) | .digest // empty' 2>/dev/null \
-            | sed 's/^sha256://')
-    fi
-    if [ -n "$expected_sha" ]; then
-        remote_sha=$(sha256sum "$tmp_file" | awk '{print $1}')
-        if [ "$expected_sha" != "$remote_sha" ]; then
-            red "cloudflared 下载文件 SHA256 校验失败（期望 ${expected_sha}，实际 ${remote_sha}），可能被篡改或下载不完整，已中止"
-            rm -f "$tmp_file"
-            return 1
-        fi
-        green "SHA256 校验通过"
-    else
-        yellow "警告：未能从 GitHub API 获取该文件的官方 SHA256（可能是限流），跳过校验，请自行确认下载来源可信"
-    fi
 
     mv "$tmp_file" "$dest"
     chmod +x "$dest"
