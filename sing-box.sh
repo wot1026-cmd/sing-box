@@ -282,7 +282,7 @@ pick_free_port() {
     local proto="$1" flag port attempts=0
     [ "$proto" = udp ] && flag=-ulnH || flag=-tlnH
     port=$(shuf -i 10000-65000 -n 1)
-    while ss "$flag" | awk '{print $5}' | grep -q ":${port}$"; do
+    while ss "$flag" | awk '{print $4}' | grep -q ":${port}$"; do
         port=$(shuf -i 10000-65000 -n 1)
         (( attempts++ > 100 )) && { echo "无法找到空闲 ${proto^^} 端口" >&2; return 1; }
     done
@@ -300,7 +300,7 @@ install_singbox() {
 
     local arch
     arch=$(detect_arch) || return 1
-    if ss -tlnH | awk '{print $5}' | grep -q ":${ARGO_PORT}$"; then
+    if ss -tlnH | awk '{print $4}' | grep -q ":${ARGO_PORT}$"; then
         yellow "端口 ${ARGO_PORT} 已被占用，自动选用空闲 TCP 端口"
         local new_argo_port
         new_argo_port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
@@ -350,11 +350,11 @@ install_singbox() {
             yellow "备份配置内容异常，已忽略备份，将生成全新配置"
             restore_backup=false
         else
-            if ss -ulnH | awk '{print $5}' | grep -q ":${hy2_port}$"; then
+            if ss -ulnH | awk '{print $4}' | grep -q ":${hy2_port}$"; then
                 yellow "备份中的 Hysteria2 端口 ${hy2_port} 已被占用，将重新分配"
                 hy2_port=$(pick_free_udp_port) || { _install_singbox_rollback; return 1; }
             fi
-            if ss -tlnH | awk '{print $5}' | grep -q ":${argo_port}$"; then
+            if ss -tlnH | awk '{print $4}' | grep -q ":${argo_port}$"; then
                 yellow "备份中的 VLESS-Argo 端口 ${argo_port} 已被占用，将使用默认端口 ${ARGO_PORT}"
                 argo_port="${ARGO_PORT}"
             fi
@@ -574,8 +574,8 @@ EOF
 
                 _ep_port=$(jq -r '.listen_port' <<< "$_ep_inbound")
                 case "$_ep_tag" in tuic) _ep_proto="udp" ;; *) _ep_proto="tcp" ;; esac
-                if { [ "$_ep_proto" = udp ] && ss -ulnH | awk '{print $5}' | grep -q ":${_ep_port}$"; } \
-                   || { [ "$_ep_proto" = tcp ] && ss -tlnH | awk '{print $5}' | grep -q ":${_ep_port}$"; }; then
+                if { [ "$_ep_proto" = udp ] && ss -ulnH | awk '{print $4}' | grep -q ":${_ep_port}$"; } \
+                   || { [ "$_ep_proto" = tcp ] && ss -tlnH | awk '{print $4}' | grep -q ":${_ep_port}$"; }; then
                     yellow "备份中 ${_ep_tag} 端口 ${_ep_port} 已被占用，跳过恢复该协议（可安装后手动重新添加）"
                     continue
                 fi
@@ -1036,7 +1036,7 @@ change_config() {
                 fi
                 # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
                 # 确认/改回原端口会被自己服务正在监听的端口挡住
-                if [ "$new_port" != "$old_port" ] && ss -ulnH | awk '{print $5}' | grep -q ":${new_port}$"; then
+                if [ "$new_port" != "$old_port" ] && ss -ulnH | awk '{print $4}' | grep -q ":${new_port}$"; then
                     red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
                 fi
             fi
@@ -1074,7 +1074,7 @@ change_config() {
             fi
             # 端口和当前自己正在用的端口相同时跳过占用检查，否则用户想
             # 确认/改回原端口会被自己服务正在监听的端口挡住
-            if [ "$new_port" != "$old_port" ] && ss -tlnH | awk '{print $5}' | grep -q ":${new_port}$"; then
+            if [ "$new_port" != "$old_port" ] && ss -tlnH | awk '{print $4}' | grep -q ":${new_port}$"; then
                 red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
             fi
 
@@ -1613,7 +1613,7 @@ add_protocol_tuic() {
             password=$(openssl rand -hex 16)
         else
             # 旧端口若已被占用（比如期间装了别的服务），自动换新端口，不阻塞流程
-            if ss -ulnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            if ss -ulnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_udp_port) || { red "无法分配空闲 UDP 端口"; return 1; }
             fi
@@ -1711,7 +1711,7 @@ add_protocol_reality() {
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             uuid=$(cat /proc/sys/kernel/random/uuid)
         else
-            if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             fi
@@ -1795,7 +1795,7 @@ add_protocol_anytls() {
             port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             password=$(openssl rand -hex 16)
         else
-            if ss -tlnH 2>/dev/null | awk '{print $5}' | grep -q ":${port}$"; then
+            if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
                 yellow "旧端口 ${port} 已被占用，自动分配新端口"
                 port=$(pick_free_tcp_port) || { red "无法分配空闲 TCP 端口"; return 1; }
             fi
