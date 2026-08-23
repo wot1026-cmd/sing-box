@@ -36,6 +36,23 @@ command -v systemctl >/dev/null 2>&1 || { red "本脚本仅支持 systemd 系统
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ── crontab 安全删行 ──────────────────────────────
+# 用法：_crontab_remove_matching <匹配模式>
+# 直接用 `crontab -l | grep -v ... | crontab -` 有风险：crontab -l 一旦因瞬时异常
+# （锁竞争、读取失败等）返回空内容而不是报错，grep -v 对空输入同样输出为空，
+# 最终会把用户整个 crontab（包括本脚本之外的其他任务）静默清空，且没有任何提示。
+# 这里显式检查 crontab -l 的退出码：只有确认真正读取成功（哪怕内容本来就是空）
+# 才允许写回；退出码非 0（无 crontab 或读取异常）一律跳过，不做任何写入——
+# 跳过最坏情况是这次没删成，写回最坏情况是清空所有任务，两者不对等，优先选跳过。
+_crontab_remove_matching() {
+    local pattern="$1"
+    local existing ret
+    existing=$(crontab -l 2>/dev/null)
+    ret=$?
+    [ "$ret" -ne 0 ] && return 0
+    grep -vF "$pattern" <<< "$existing" | crontab - 2>/dev/null
+}
+
 # ── 服务状态检查 ───────────────────────────────────
 check_service() {
     local name="$1" binary="$2"
@@ -1937,11 +1954,11 @@ remove_protocol() {
         if ! jq -e --arg d "$_removed_acme_domain" \
             '.inbounds[] | select(.tls.server_name == $d)' \
             "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
-            crontab -l 2>/dev/null | grep -vF "# sing-box-extra-protocols acme sync: ${_removed_acme_domain}" | crontab - 2>/dev/null
+            _crontab_remove_matching "# sing-box-extra-protocols acme sync: ${_removed_acme_domain}"
         fi
         # 若已没有任何协议在使用 acme，续期检查任务也一并清理
         if [ ! -s "${work_dir}/protocols_acme.list" ]; then
-            crontab -l 2>/dev/null | grep -vF "# sing-box-extra-protocols acme renew-check" | crontab - 2>/dev/null
+            _crontab_remove_matching "# sing-box-extra-protocols acme renew-check"
         fi
     fi
 
@@ -2441,7 +2458,7 @@ _do_uninstall_core() {
         rm -rf "$backup_dir" 2>/dev/null
         # 彻底卸载（不保留配置）时才清理 acme 相关的 cron 任务（续期检查 + 证书同步）；
         # 保留配置场景下这些任务在重装恢复后仍需继续运行，不能清
-        crontab -l 2>/dev/null | grep -v "# sing-box-extra-protocols acme" | crontab - 2>/dev/null
+        _crontab_remove_matching "# sing-box-extra-protocols acme"
 
         # 彻底卸载时同时恢复安装脚本对系统层做过的改动，语义是"恢复原状"：
         # - 禁用 IPv6 的 sysctl 配置
