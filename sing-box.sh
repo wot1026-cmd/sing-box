@@ -3001,7 +3001,7 @@ restore_autofixed_lines() {
         [ -z "$line" ] && continue
         [ -f "$file" ] || continue
         if sed -n "${line}p" "$file" 2>/dev/null | grep -qE '^[[:space:]]*# \[由sing-box\.sh(自动清理|注释)\] '; then
-            sed -i "${line}s|^\([[:space:]]*\)# \[由sing-box\.sh\(自动清理\|注释\)\] |\1|" "$file"
+            sed -i -E "${line}s~^([[:space:]]*)# \[由sing-box\.sh(自动清理|注释)\] ~\1~" "$file"
             restored=1
         fi
     done < "$log"
