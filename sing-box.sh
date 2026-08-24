@@ -3065,6 +3065,10 @@ IPV6_AUTOFIX_LOG="/etc/sing-box/ipv6-autofix.log"
 # 卸载清理时只删日志里记录过的文件，不用通配符扫描整个目录——避免删掉其他
 # 软件或用户手工创建的同名 .bak.* 文件。
 DNS_BACKUP_LOG="/etc/sing-box/dns-backup.log"
+# dns_clear_link_overrides 每次清理掉某张网卡的链路层 DNS 覆盖时，记一行
+# "时间戳<TAB>网卡列表" 到这里，纯粹是留痕方便用户/排查时回溯，不用于自动恢复
+# （链路层覆盖通常来自 DHCP/NetworkManager，脚本不保存原始值，也不负责替它恢复）。
+DNS_LINK_OVERRIDE_LOG="/etc/sing-box/dns-link-override.log"
 
 # initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
 # 必须用 ip route 单独设置。作用：新连接建立时首波无需等 ACK 就能发送的包数，
@@ -3547,8 +3551,76 @@ dns_get_status() {
     local mode="$1"
     if [ "$mode" = "systemd-resolved" ]; then
         resolvectl status 2>/dev/null | grep -A2 "Current DNS Server\|DNS Servers" | head -6
+        dns_warn_remaining_link_overrides
     else
         grep "^nameserver" /etc/resolv.conf 2>/dev/null
+    fi
+}
+
+# ── 提示仍然存在的链路层 DNS 覆盖 ──────────────────
+# dns_apply 里的 dns_clear_link_overrides 会在"设置 DNS"这个动作发生时主动
+# revert 一次，但如果 revert 因权限/版本差异等原因失败，或者用户此后又通过
+# NetworkManager/DHCP 重新拿到了链路层 DNS，仅在设置那一刻提示一次是不够的
+# ——用户随后查看"当前生效DNS"（dns_menu 里查看状态、每次 dns_apply 结束时）
+# 也应该能看到这个提示，而不是误以为全局设置就是最终生效值。
+# 只提示、不自动处理：这里是"查看状态"路径，静默改动网卡配置不合适。
+dns_warn_remaining_link_overrides() {
+    command -v resolvectl >/dev/null 2>&1 || return 0
+    local ifaces iface link_dns found=()
+    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+    [ -z "$ifaces" ] && return 0
+    for iface in $ifaces; do
+        link_dns=$(resolvectl dns "$iface" 2>/dev/null | sed "s/^Link [0-9]*[[:space:]]*(${iface})[[:space:]]*:[[:space:]]*//")
+        link_dns=$(echo "$link_dns" | tr -d '[:space:]')
+        [ -n "$link_dns" ] && found+=("$iface")
+    done
+    if [ ${#found[@]} -gt 0 ]; then
+        yellow "注意：以下网卡当前仍存在链路层 DNS 覆盖，可能导致实际生效的 DNS 与上方全局设置不一致：${found[*]}"
+        yellow "可手动执行 resolvectl revert <网卡名> 清除，或重新进入本菜单设置 DNS 以再次尝试清理。"
+    fi
+}
+
+# ── 清理 systemd-resolved 链路层 DNS 覆盖 ──────────
+# 背景：systemd-resolved 下，per-link DNS（曾用 `resolvectl dns <网卡> ...`
+# 单独配置过、或由 NetworkManager/networkd 通过 DHCP 下发到某张网卡的 DNS）
+# 优先级高于 [Resolve] 里的全局 DNS=。dns_apply 之前只改全局配置、重启服务，
+# 但如果某张网卡存在链路层覆盖，`resolvectl status` 该网卡下依然会显示旧
+# DNS，全局设置形同虚设——用户会遇到"菜单里改了，但没真正生效"的情况，
+# 且脚本此前不会有任何提示。
+#
+# 这里在设置全局 DNS 之后，检测每张网卡是否存在非空的 per-link DNS，若有，
+# 用 `resolvectl revert <iface>` 清掉该网卡的链路层覆盖，让它重新落回全局
+# 设置生效。记录被清理过的网卡到 DNS_LINK_OVERRIDE_LOG，便于用户或后续
+# 排查时知道动过哪些网卡（revert 本身不承诺可逆——原始 per-link 值不会被
+# 脚本保存下来，因为它通常来自 DHCP/NetworkManager 等外部来源，重新走一次
+# DHCP 续租或重启对应服务通常就能拿回来；这里的目的是让菜单里选的 DNS
+# 真正生效，而不是完整可逆的备份）。
+dns_clear_link_overrides() {
+    command -v resolvectl >/dev/null 2>&1 || return 0
+
+    local ifaces iface link_dns cleared=()
+    # 遍历 /sys/class/net 下真实存在的网卡（排除 lo），对每一张调用
+    # `resolvectl dns <iface>`：非空输出即视为存在链路层 DNS 覆盖。
+    # 用 status 里的 "Current Scopes"/"Link" 段做判断在不同版本 resolvectl
+    # 输出格式不一致，不够可靠，这里改用更直接的 `resolvectl dns <iface>`。
+    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+    [ -z "$ifaces" ] && return 0
+
+    for iface in $ifaces; do
+        link_dns=$(resolvectl dns "$iface" 2>/dev/null | sed "s/^Link [0-9]*[[:space:]]*(${iface})[[:space:]]*:[[:space:]]*//")
+        link_dns=$(echo "$link_dns" | tr -d '[:space:]')
+        if [ -n "$link_dns" ]; then
+            if resolvectl revert "$iface" >/dev/null 2>&1; then
+                cleared+=("$iface")
+            fi
+        fi
+    done
+
+    if [ ${#cleared[@]} -gt 0 ]; then
+        mkdir -p "$(dirname "$DNS_LINK_OVERRIDE_LOG")" 2>/dev/null
+        printf '%s\t%s\n' "$(date +%Y%m%d%H%M%S)" "${cleared[*]}" >> "$DNS_LINK_OVERRIDE_LOG"
+        yellow "检测到以下网卡存在链路层 DNS 覆盖，已清除以确保全局 DNS 生效：${cleared[*]}"
+        yellow "（该覆盖通常来自 DHCP/NetworkManager 下发，如后续网络重连/续租，可能会被重新下发覆盖全局设置）"
     fi
 }
 
@@ -3578,6 +3650,11 @@ dns_apply() {
             fi
         fi
         systemctl restart systemd-resolved
+        # 全局配置重启生效之后再清链路层覆盖：如果顺序反过来，中间会有一段
+        # 窗口——网卡的链路层覆盖已被清掉，但 resolved 还没重启加载新的全局
+        # 配置——该网卡可能短暂丢失所有 DNS。放在 restart 之后，revert 时
+        # 网卡能立刻落回刚生效的新全局 DNS。
+        dns_clear_link_overrides
         green "\n已通过 systemd-resolved 设置 DNS: ${dns1} ${dns2}\n"
     else
         local _resolv_bak
