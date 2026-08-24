@@ -630,6 +630,7 @@ EOF
         # 注释过的系统配置行并恢复；否则这条恢复链路会在这次重装后失效。
         [ -f "${backup_dir}/bbr-autofix.log" ]  && cp "${backup_dir}/bbr-autofix.log"  "$BBR_AUTOFIX_LOG"
         [ -f "${backup_dir}/ipv6-autofix.log" ] && cp "${backup_dir}/ipv6-autofix.log" "$IPV6_AUTOFIX_LOG"
+        [ -f "${backup_dir}/sshd_af_added.flag" ] && cp "${backup_dir}/sshd_af_added.flag" "${work_dir}/sshd_af_added.flag"
 
         # ── 恢复备用协议（TUIC / Reality / AnyTLS）──
         # inbounds.json 是按固定模板重新生成的（不是整体复制备份），
@@ -1075,18 +1076,27 @@ change_config() {
                 red "UUID 格式不合法"; sleep 1; return 0
             fi
             # 仅修改 Argo VLESS 的 UUID 和 path（按 tag 精确匹配，避免误改 Reality 的 vless inbound）
+            local _uuid_bak
+            _uuid_bak=$(mktemp) && cp "$inbounds_file" "$_uuid_bak" || { red "备份配置文件失败，已取消"; sleep 2; return 0; }
             if ! jq --arg u "$new_uuid" --arg p "/${new_uuid}-vless" '
                 (.inbounds[] | select(.tag=="vless-ws") | .users[] | .uuid) = $u |
                 (.inbounds[] | select(.tag=="vless-ws") | .transport.path) = $p
             ' "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                rm -f "$_uuid_bak"
                 red "配置文件写入失败，请检查！"; sleep 2; return 0
             fi
             if restart_singbox; then
+                rm -f "$_uuid_bak"
                 get_info
                 green "\nUUID 已修改为：${new_uuid}\n"
             else
-                red "\n配置文件中的 UUID 已更新为 ${new_uuid}，但 sing-box 重启失败，节点当前不可用"
-                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                yellow "sing-box 重启失败，正在回滚 UUID 配置…"
+                mv "$_uuid_bak" "$inbounds_file"
+                if restart_singbox; then
+                    red "\n已回滚到修改前的 UUID，请排查后重试\n"
+                else
+                    red "\n回滚后服务仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                fi
             fi
             ;;
 
@@ -1106,9 +1116,12 @@ change_config() {
                     red "端口 ${new_port} 已被占用，请换一个"; sleep 1; return 0
                 fi
             fi
+            local _hy2_bak
+            _hy2_bak=$(mktemp) && cp "$inbounds_file" "$_hy2_bak" || { red "备份配置文件失败，已取消"; sleep 2; return 0; }
             if ! jq --argjson p "$new_port" \
                 '(.inbounds[] | select(.type=="hysteria2") | .listen_port) = $p' \
                 "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                rm -f "$_hy2_bak"
                 red "配置写入失败"; sleep 1; return 0
             fi
             # 用统一的 remove_port/allow_port（而非手动摘 DROP 再插回），
@@ -1119,11 +1132,20 @@ change_config() {
             allow_port "${new_port}/udp"
 
             if restart_singbox; then
+                rm -f "$_hy2_bak"
                 get_info
                 green "\nHysteria2 端口已修改为：${new_port}\n"
             else
-                red "\n端口已更新为 ${new_port}，但 sing-box 重启失败，节点当前不可用"
-                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                yellow "sing-box 重启失败，正在回滚端口配置…"
+                mv "$_hy2_bak" "$inbounds_file"
+                # 恢复防火墙规则
+                remove_port "${new_port}/udp"
+                [ -n "$old_port" ] && [ "$old_port" != "null" ] && [ "$old_port" != "$new_port" ] && allow_port "${old_port}/udp"
+                if restart_singbox; then
+                    red "\n已回滚到端口 ${old_port}，请排查后重试\n"
+                else
+                    red "\n回滚后服务仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                fi
             fi
             ;;
         3)
@@ -1163,9 +1185,16 @@ change_config() {
                 fi
             fi
 
+            local _vless_bak _tunnel_yml_bak
+            _vless_bak=$(mktemp) && cp "$inbounds_file" "$_vless_bak" || { red "备份配置文件失败，已取消"; sleep 2; return 0; }
+            if [ -f "${work_dir}/tunnel.yml" ] && ! $is_token_mode; then
+                _tunnel_yml_bak=$(mktemp) && cp "${work_dir}/tunnel.yml" "$_tunnel_yml_bak"
+            fi
+
             if ! jq --argjson p "$new_port" \
                 '(.inbounds[] | select(.tag=="vless-ws") | .listen_port) = $p' \
                 "$inbounds_file" | write_json_atomic "$inbounds_file"; then
+                rm -f "$_vless_bak" "$_tunnel_yml_bak"
                 red "配置写入失败"; sleep 1; return 0
             fi
 
@@ -1178,6 +1207,7 @@ change_config() {
                 fi
             fi
             if restart_singbox; then
+                rm -f "$_vless_bak" "$_tunnel_yml_bak"
                 if restart_argo; then
                     get_info
                     green "\nVLESS-Argo 端口已修改为：${new_port}\n"
@@ -1186,8 +1216,14 @@ change_config() {
                     red "请检查：journalctl -u argo -n 50 --no-pager\n"
                 fi
             else
-                red "\n端口已更新为 ${new_port}，但 sing-box 重启失败，节点当前不可用"
-                red "请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                yellow "sing-box 重启失败，正在回滚端口配置…"
+                mv "$_vless_bak" "$inbounds_file"
+                [ -n "$_tunnel_yml_bak" ] && [ -f "$_tunnel_yml_bak" ] && mv "$_tunnel_yml_bak" "${work_dir}/tunnel.yml"
+                if restart_singbox; then
+                    red "\n已回滚到端口 ${old_port}，请排查后重试\n"
+                else
+                    red "\n回滚后服务仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                fi
             fi
             ;;
 
@@ -1516,8 +1552,14 @@ _ensure_acme_sh_installed() {
     # 自定义 --home（${work_dir}/.acme.sh），执行了也没用，等同垃圾任务。
     # 之前是靠传 --nocron 从源头不生成它，现在改为装完后手动清理，效果等价，
     # 见上方大段注释里对 --nocron 参数解析 bug 的说明。
+    #
+    # 注意：这里必须用 _crontab_remove_matching（安全函数），不能直接写
+    # `crontab -l | grep -v ... | crontab -`。原因见该函数上方注释——crontab -l
+    # 一旦因瞬时异常返回空内容，grep -v 对空输入同样输出空，最终会把整个 root
+    # crontab 静默清空。而 install.sh 注入的任务 marker 是 'acme.sh --cron'，
+    # _crontab_remove_matching 用 -F（固定字符串）匹配，不会意外误删其他任务。
     if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -v 'acme\.sh --cron' | crontab - 2>/dev/null || true
+        _crontab_remove_matching "acme.sh --cron"
     fi
     green "acme.sh 安装完成" >&2
     return 0
@@ -2163,18 +2205,43 @@ manage_extra_protocols() {
                 # 协议数量固定为个位数，序号直接连写即可，仍兼容空格分隔
                 local del_compact="${del_choices// /}"
                 local c idx dtag j
+                # 删除前备份 inbounds.json 和 protocols.list，供 restart 失败时事务回滚。
+                # restart 发生在所有删除动作完成后（批量），必须在循环前备份原始状态。
+                local _del_proto_bak _del_plist_bak
+                _del_proto_bak=$(mktemp) && cp "${conf_dir}/inbounds.json" "$_del_proto_bak" \
+                    || { red "备份配置文件失败，已取消删除"; continue; }
+                _del_plist_bak=$(mktemp) && cp "${work_dir}/protocols.list" "$_del_plist_bak" \
+                    || { rm -f "$_del_proto_bak"; red "备份协议列表失败，已取消删除"; continue; }
+                local _del_ports=()  # 记录被删的端口/协议，回滚时重新放行
                 for (( j=0; j<${#del_compact}; j++ )); do
                     c="${del_compact:$j:1}"
                     [[ "$c" =~ ^[0-9]$ ]] || continue
                     idx=$((c - 1))
                     [ "$idx" -lt 0 ] || [ "$idx" -ge "${#EXTRA_PROTO_ORDER[@]}" ] && continue
                     dtag="${EXTRA_PROTO_ORDER[$idx]}"
+                    local _dp _dproto
+                    _dp=$(jq -r --arg t "$dtag" '.inbounds[] | select(.tag==$t) | .listen_port' \
+                        "${conf_dir}/inbounds.json" 2>/dev/null)
+                    _dproto="${EXTRA_PROTO_TRANSPORT[$dtag]:-tcp}"
                     remove_protocol "$dtag"
+                    [ -n "$_dp" ] && [ "$_dp" != "null" ] && _del_ports+=("${_dp}/${_dproto}")
                 done
                 if restart_singbox; then
+                    rm -f "$_del_proto_bak" "$_del_plist_bak"
                     get_info
                 else
-                    red "\n协议已删除，但 sing-box 重启失败，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                    red "\n协议删除后 sing-box 重启失败，正在回滚…"
+                    mv "$_del_proto_bak" "${conf_dir}/inbounds.json"
+                    mv "$_del_plist_bak" "${work_dir}/protocols.list"
+                    # 恢复防火墙：重新放行被删掉的端口
+                    for _rp in "${_del_ports[@]}"; do
+                        allow_port "$_rp"
+                    done
+                    if restart_singbox; then
+                        red "已回滚到删除前状态，请排查后重试\n"
+                    else
+                        red "回滚后服务仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                    fi
                 fi
                 ;;
             c|C)
@@ -2410,15 +2477,25 @@ configure_fixed_tunnel() {
     yellow "当前 VLESS 端口: ${current_argo_port}\n"
 
     if [[ "$argo_auth" =~ TunnelSecret ]]; then
+        # 先验证 JSON 格式合法且包含必要字段，再落盘，避免写入坏文件。
+        if ! echo "$argo_auth" | jq empty 2>/dev/null; then
+            red "输入内容不是合法 JSON，请重新检查后粘贴"; return 0
+        fi
+        local tunnel_id
+        tunnel_id=$(echo "$argo_auth" \
+            | jq -r '(.TunnelID // .tunnelID // .tunnel_id) // empty' 2>/dev/null)
+        local tunnel_secret
+        tunnel_secret=$(echo "$argo_auth" \
+            | jq -r '(.TunnelSecret // .tunnelSecret // .tunnel_secret) // empty' 2>/dev/null)
+        if [ -z "$tunnel_id" ] || [ -z "$tunnel_secret" ]; then
+            red "JSON 中未找到 TunnelID 或 TunnelSecret 字段，请检查凭据格式"; return 0
+        fi
         # 写入 JSON 模式前先清掉 Token 模式可能残留的 argo_token，避免
         # change_config 等处依赖"文件是否存在"判断模式时被旧文件误导，
         # 导致以为还是 Token 模式、走错分支（改端口静默失效等问题）。
         rm -f "${work_dir}/argo_token"
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         chmod 600 "${work_dir}/tunnel.json"
-        local tunnel_id
-        tunnel_id=$(echo "$argo_auth" \
-            | jq -r '(.TunnelID // .tunnelID // .tunnel_id) // empty' 2>/dev/null)
 
         [ -z "$tunnel_id" ] && { red "无法解析 TunnelID，请检查 JSON 格式"; return 0; }
 
@@ -2573,6 +2650,7 @@ _do_uninstall_core() {
         [ -f "${work_dir}/reality.key" ]     && cp "${work_dir}/reality.key"     "${backup_dir}/reality.key"
         [ -f "${work_dir}/reality.shortid" ] && cp "${work_dir}/reality.shortid" "${backup_dir}/reality.shortid"
         [ -d "${work_dir}/protocol_creds" ]  && cp -r "${work_dir}/protocol_creds" "${backup_dir}/protocol_creds"
+        [ -f "${work_dir}/sshd_af_added.flag" ] && cp "${work_dir}/sshd_af_added.flag" "${backup_dir}/sshd_af_added.flag"
         # autofix 日志记录了"哪个系统文件的哪一行被自动注释过"，必须随节点配置
         # 一起备份，否则重装后这份日志随 work_dir 一起被删，将来彻底卸载时
         # restore_autofixed_lines 找不到日志，被自动注释的系统配置行会永久
@@ -2612,19 +2690,29 @@ _do_uninstall_core() {
         # - BBR 调优 sysctl 配置
         # - initcwnd/initrwnd 调优（独立的 systemd service + 脚本，不在 sysctl.d 里，
         #   之前漏了这一步，导致"彻底卸载"后 initcwnd 32 依然每次开机生效）
-        # - sshd 限制为仅监听 IPv4（AddressFamily inet）
-        # 以及安装/配置过程中残留的 .bak.* 备份文件
+        # - sshd 限制为仅监听 IPv4（AddressFamily inet，仅在本脚本添加时才删）
         rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
-        rm -f /etc/sysctl.d/*.bak.* /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
+        # 只删本脚本明确创建的 .bak.* 文件，不用 /etc/sysctl.d/*.bak.* 通配符扫全目录，
+        # 避免误删其他软件生成的同名备份。
+        # - dns_apply 生成 /etc/resolv.conf.bak.* 和 /etc/systemd/resolved.conf.bak.*
+        # - sysctl.d 下的 .bak.* 由 bbr_clean/IPv6 autofix 生成，
+        #   restore_autofixed_lines 内部会清理 IPV6_AUTOFIX_LOG 记录的行，
+        #   bbr_restore_autofixed_lines 也同样；剩余 sysctl.d .bak.* 保留不动。
+        rm -f /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
         bbr_remove_initcwnd
         bbr_restore_autofixed_lines
         restore_autofixed_lines "$IPV6_AUTOFIX_LOG"
-        if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
-            sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
-            if sshd -t 2>/dev/null; then
-                systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
-            else
-                yellow "警告：移除 sshd AddressFamily inet 后配置测试失败，请手动检查 /etc/ssh/sshd_config"
+        # 只有本脚本在 setup_firewall_base() 中添加过 AddressFamily inet 才删除；
+        # 若用户原本就有这一行，卸载时不应动它。
+        # 判断依据：work_dir 内的标记文件 sshd_af_added.flag（安装时写入，见 setup_firewall_base）。
+        if [ -f "${work_dir}/sshd_af_added.flag" ]; then
+            if grep -q "^AddressFamily inet" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
+                if sshd -t 2>/dev/null; then
+                    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+                else
+                    yellow "警告：移除 sshd AddressFamily inet 后配置测试失败，请手动检查 /etc/ssh/sshd_config"
+                fi
             fi
         fi
         sysctl --system >/dev/null 2>&1
@@ -2704,18 +2792,25 @@ update_script() {
     curl -fsSL "$SCRIPT_URL" -o "$tmp"
     if [ -s "$tmp" ] && grep -q 'install_singbox' "$tmp"; then
         mkdir -p "${work_dir}"
+        # 先备份当前版本，这样下面写入失败或用户想回退时还有真正的旧版本可用。
+        # 之前直接 mv $tmp 没有任何备份，"已回滚"的提示是误导——下载失败时旧文件
+        # 还在，下载成功后写入失败才是真正的问题点；有了备份后两种情况都能恢复。
+        local bak_path="${work_dir}/sb.sh.bak"
+        [ -f "${work_dir}/sb.sh" ] && cp "${work_dir}/sb.sh" "$bak_path" 2>/dev/null
         if ! mv "$tmp" "${work_dir}/sb.sh"; then
             rm -f "$tmp"
-            red "更新失败：无法写入 ${work_dir}/sb.sh\n"
+            [ -f "$bak_path" ] && mv "$bak_path" "${work_dir}/sb.sh"
+            red "更新失败：无法写入 ${work_dir}/sb.sh，已回滚到旧版本\n"
             return 1
         fi
         chmod +x "${work_dir}/sb.sh"
         ln -sf "${work_dir}/sb.sh" /usr/bin/sb
+        rm -f "$bak_path"
         green "脚本已更新，请重新运行 sb\n"
         exit 0
     else
         rm -f "$tmp"
-        red "更新失败：下载内容异常，已回滚\n"
+        red "更新失败：下载内容异常，本地脚本未变动\n"
     fi
 }
 
@@ -3497,7 +3592,8 @@ EOF
                 [ "$f" = "/etc/sysctl.d/99-disable-ipv6.conf" ] && continue
                 [[ "$f" == *.bak || "$f" =~ \.bak\.[0-9]+$ ]] && continue
                 grep -qE "^[[:space:]]*${ipv6_key//./\\.}[[:space:]]*=[[:space:]]*0" "$f" 2>/dev/null || continue
-                rm -f "${f}.bak."[0-9]*
+                # 使用时间戳追加备份，不删除已有的 .bak.* 文件——旧备份可能来自其他工具，
+                # 删除会丢失用户之前的恢复点，且该文件此前可能已在本轮循环中被备份过了。
                 cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
                 local ipv6_ln
                 while IFS=: read -r ipv6_ln; do
@@ -3533,6 +3629,9 @@ EOF
         if sshd -t 2>/dev/null; then
             systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
             green "sshd 已设置为仅监听 IPv4（reload）"
+            # 记录"这一行是本脚本添加的"，卸载时据此决定是否删除，
+            # 避免误删用户原本就存在的 AddressFamily inet 行。
+            touch "${work_dir}/sshd_af_added.flag" 2>/dev/null
         else
             yellow "sshd 配置测试失败，回滚 AddressFamily 设置"
             sed -i '/^AddressFamily inet/d' /etc/ssh/sshd_config
