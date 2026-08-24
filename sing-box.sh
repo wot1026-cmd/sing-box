@@ -1478,7 +1478,14 @@ _ensure_acme_sh_installed() {
     # 而本脚本读取可执行文件用的是写死的 /root/.acme.sh/acme.sh —— 如果调用
     # 环境的 $HOME 不是 /root（部分 su/sudo/容器场景可能出现），两边路径就会
     # 对不上，导致"装是装了，但在预期路径找不到"。显式锚定 HOME=/root 消除这个隐患。
-    if ! HOME=/root sh "$_acme_installer" --nocron >"$_acme_install_log" 2>&1; then
+    #
+    # 不再传 --nocron：acme.sh 官方 install.sh 在直接调用并传长参数（--xxx）时
+    # 有已知 bug，会把参数自身的 "--" 重复拼接一层，导致 "--nocron" 变成
+    # "----nocron"，被当成未知参数、安装直接报错退出（GitHub 官方仓库
+    # issue #3683 等多个反馈过同一现象，非本脚本调用方式导致）。规避方法是
+    # 完全不给 install.sh 传任何长参数，装完之后再手动删除它自动创建的系统级
+    # crontab 条目，效果与 --nocron 等价，且不会触发该参数解析 bug。
+    if ! HOME=/root sh "$_acme_installer" >"$_acme_install_log" 2>&1; then
         red "acme.sh 安装失败，详情：" >&2
         tail -n 20 "$_acme_install_log" >&2
         rm -f "$_acme_installer" "$_acme_install_log"
@@ -1493,6 +1500,14 @@ _ensure_acme_sh_installed() {
         return 1
     fi
     rm -f "$_acme_install_log"
+    # install.sh 默认会自动写入一条系统级 crontab（用于每日续期检查），但这条
+    # 任务固定使用默认 --home（/root/.acme.sh），读不到本脚本实际存放证书数据的
+    # 自定义 --home（${work_dir}/.acme.sh），执行了也没用，等同垃圾任务。
+    # 之前是靠传 --nocron 从源头不生成它，现在改为装完后手动清理，效果等价，
+    # 见上方大段注释里对 --nocron 参数解析 bug 的说明。
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v 'acme\.sh --cron' | crontab - 2>/dev/null || true
+    fi
     green "acme.sh 安装完成" >&2
     return 0
 }
