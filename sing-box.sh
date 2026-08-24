@@ -2973,8 +2973,7 @@ bbr_autofix_conflicts() {
 
 bbr_write_conf() {
     # $1 = rmem/wmem 上限字节数, $2 = 场景描述文字, $3 = RTT毫秒（可选，用于 notsent_lowat 分档，默认150）
-    # $4 = 是否包含"改变TCP默认行为"的激进参数组（y/n，默认n，由调用方询问后传入）
-    local buf="$1" desc="$2" rtt="${3:-150}" aggressive="${4:-n}" notsent_lowat
+    local buf="$1" desc="$2" rtt="${3:-150}" notsent_lowat
     if [ "$rtt" -ge 120 ]; then
         notsent_lowat=16384
     else
@@ -3023,29 +3022,16 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 EOF
-    if [[ "$aggressive" =~ ^[yY]$ ]]; then
-        cat >> "$BBR_CONF" << EOF
+    # 统一显式写回标准 Linux 默认值：如果这台机器之前跑过老版本脚本
+    # 或曾应用过激进参数组，这些参数已经被改过，仅仅"配置文件里不写"不会让内核
+    # 恢复默认——sysctl --system 只应用文件里存在的键，未写的键维持
+    # 现状。这里显式写回标准 Linux 默认值使其真正复位。
+    # tcp_max_tw_buckets 的内核默认值随内存大小变化、无统一常量，这里
+    # 不做重置；如此前应用过激进参数组，请重启使其恢复内核自动计算的
+    # 默认值。
+    cat >> "$BBR_CONF" << EOF
 
-# ── 进阶参数（改变TCP默认超时/重试/MTU行为）──
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_orphan_retries = 3
-net.ipv4.tcp_max_tw_buckets = 6000
-net.ipv4.tcp_mtu_probing = 1
-EOF
-    else
-        # 非激进场景也显式写回内核默认值：如果这台机器之前跑过老版本脚本
-        # 或激进场景，这些参数已经被改过，仅仅"配置文件里不写"不会让内核
-        # 恢复默认——sysctl --system 只应用文件里存在的键，未写的键维持
-        # 现状。这里显式写回标准 Linux 默认值使其真正复位。
-        # tcp_max_tw_buckets 的内核默认值随内存大小变化、无统一常量，这里
-        # 不做重置；如此前应用过激进场景，请重启使其恢复内核自动计算的
-        # 默认值。
-        cat >> "$BBR_CONF" << EOF
-
-# ── 显式重置为内核默认值（避免此前激进场景/旧版本脚本的残留）──
+# ── 显式重置为内核默认值（避免此前激进参数组/旧版本脚本的残留）──
 net.ipv4.tcp_fin_timeout = 60
 net.ipv4.tcp_retries2 = 15
 net.ipv4.tcp_syn_retries = 6
@@ -3053,7 +3039,6 @@ net.ipv4.tcp_synack_retries = 5
 net.ipv4.tcp_orphan_retries = 0
 net.ipv4.tcp_mtu_probing = 0
 EOF
-    fi
     sysctl --system >/dev/null 2>&1
     # 先做一次自动冲突消除：只要 BBR_CONF 里写的参数和实际生效值不一致，
     # 说明别的文件在覆盖它（sysctl.d 内按文件名排序、sysctl.conf 最后加载），
@@ -3091,14 +3076,10 @@ bbr_apply_menu() {
     skyblue "————"
     reading "\n请输入选择: " choice
     [ "$choice" = "0" ] && return 1
-    local aggressive
-    if [[ "$choice" =~ ^[1-4]$ ]]; then
-        reading "是否同时启用改变TCP默认超时/重试行为的进阶参数（fin_timeout/retries2/mtu_probing等，一般机器无需开启）？(y/N): " aggressive
-    fi
     case "$choice" in
-        1) bbr_write_conf 8388608 "日常场景 (8MB)" 150 "$aggressive" ;;
-        2) bbr_write_conf 33554432 "大文件/下载场景 (32MB)" 200 "$aggressive" ;;
-        3) bbr_write_conf 4194304 "低延迟场景 (4MB)" 50 "$aggressive" ;;
+        1) bbr_write_conf 8388608 "日常场景 (8MB)" 150 ;;
+        2) bbr_write_conf 33554432 "大文件/下载场景 (32MB)" 200 ;;
+        3) bbr_write_conf 4194304 "低延迟场景 (4MB)" 50 ;;
         4)
             reading "请输入带宽 (Mbps): " bw
             if ! [[ "$bw" =~ ^[1-9][0-9]*$ ]]; then
@@ -3125,7 +3106,7 @@ bbr_apply_menu() {
                 buf_bytes="$mem_cap"
             fi
             yellow "\nBDP ≈ $((bdp_bytes / 1024 / 1024))MB，取2倍余量，最终缓冲区上限 = $((buf_bytes / 1024 / 1024))MB\n"
-            bbr_write_conf "$buf_bytes" "自定义 (${bw}Mbps / ${rtt}ms RTT)" "$rtt" "$aggressive"
+            bbr_write_conf "$buf_bytes" "自定义 (${bw}Mbps / ${rtt}ms RTT)" "$rtt"
             ;;
         0) return 1 ;;
         *) red "无效选项"; return 0 ;;
