@@ -422,10 +422,13 @@ install_singbox() {
             hy2_password="$uuid"
         fi
 
+        # 端口字段统一走 _creds_field_valid ... port（数字 + 1-65535 范围校验），
+        # 不再自己手写纯数字正则——避免备份损坏成 99999 这类超出范围的值时
+        # 被误判为合法端口，进而被写进防火墙规则和 sing-box 配置。
         if [ -z "$uuid" ] || [ "$uuid" = "null" ] \
            || [ -z "$vless_path" ] || [ "$vless_path" = "null" ] \
-           || ! [[ "$hy2_port" =~ ^[0-9]+$ ]] \
-           || ! [[ "$argo_port" =~ ^[0-9]+$ ]]; then
+           || ! _creds_field_valid "$hy2_port" port \
+           || ! _creds_field_valid "$argo_port" port; then
             yellow "备份配置内容异常，已忽略备份，将生成全新配置"
             restore_backup=false
         else
@@ -1207,13 +1210,28 @@ change_config() {
                 fi
             fi
             if restart_singbox; then
-                rm -f "$_vless_bak" "$_tunnel_yml_bak"
                 if restart_argo; then
+                    rm -f "$_vless_bak" "$_tunnel_yml_bak"
                     get_info
                     green "\nVLESS-Argo 端口已修改为：${new_port}\n"
                 else
-                    red "\n端口已更新为 ${new_port}，sing-box 已重启，但 argo 隧道重启失败，节点当前不可用"
-                    red "请检查：journalctl -u argo -n 50 --no-pager\n"
+                    # sing-box 重启成功但 argo 隧道重启失败：新端口对隧道来说
+                    # 是"半生效"状态（本地监听已切到新端口，但 argo 侧转发不通），
+                    # 节点立即不可用。既然本次改动已经具备事务式回滚能力，这里
+                    # 不能只报错了事，要把 inbounds.json / tunnel.yml 都恢复到
+                    # 旧端口，再重启 sing-box + argo，尽量拉回到改动前的可用状态。
+                    yellow "sing-box 已重启，但 argo 隧道重启失败，正在回滚端口配置…"
+                    mv "$_vless_bak" "$inbounds_file"
+                    [ -n "$_tunnel_yml_bak" ] && [ -f "$_tunnel_yml_bak" ] && mv "$_tunnel_yml_bak" "${work_dir}/tunnel.yml"
+                    if restart_singbox; then
+                        if restart_argo; then
+                            red "\n已回滚到端口 ${old_port}，argo 隧道已恢复，请排查后重试\n"
+                        else
+                            red "\n已回滚到端口 ${old_port}，但 argo 隧道仍未能重启，请检查：journalctl -u argo -n 50 --no-pager\n"
+                        fi
+                    else
+                        red "\n回滚后 sing-box 仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+                    fi
                 fi
             else
                 yellow "sing-box 重启失败，正在回滚端口配置…"
@@ -1556,10 +1574,18 @@ _ensure_acme_sh_installed() {
     # 注意：这里必须用 _crontab_remove_matching（安全函数），不能直接写
     # `crontab -l | grep -v ... | crontab -`。原因见该函数上方注释——crontab -l
     # 一旦因瞬时异常返回空内容，grep -v 对空输入同样输出空，最终会把整个 root
-    # crontab 静默清空。而 install.sh 注入的任务 marker 是 'acme.sh --cron'，
-    # _crontab_remove_matching 用 -F（固定字符串）匹配，不会意外误删其他任务。
+    # crontab 静默清空。
+    #
+    # 匹配串不能只用 "acme.sh --cron"：acme.sh 官方 install.sh 给任何一次
+    # 安装写入的系统级 crontab 都会包含这段固定文字，如果这台机器上还有
+    # 其他项目独立装过 acme.sh（哪怕装在别的 --home 目录下），这个粗粒度
+    # 匹配会连带把那些任务也删掉。acme.sh 写入 cron 时用的是它自己可执行
+    # 文件的完整路径来调用 --cron（不同 --home 对应不同路径），而本脚本的
+    # acme.sh 固定装在 $_acme_sh_bin（/root/.acme.sh/acme.sh），因此改为
+    # 匹配这个具体路径，只删本次安装自己写入的那一条，不影响机器上其他
+    # acme.sh 实例的续期任务。
     if command -v crontab >/dev/null 2>&1; then
-        _crontab_remove_matching "acme.sh --cron"
+        _crontab_remove_matching "$_acme_sh_bin --cron"
     fi
     green "acme.sh 安装完成" >&2
     return 0
@@ -2692,13 +2718,21 @@ _do_uninstall_core() {
         #   之前漏了这一步，导致"彻底卸载"后 initcwnd 32 依然每次开机生效）
         # - sshd 限制为仅监听 IPv4（AddressFamily inet，仅在本脚本添加时才删）
         rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
-        # 只删本脚本明确创建的 .bak.* 文件，不用 /etc/sysctl.d/*.bak.* 通配符扫全目录，
-        # 避免误删其他软件生成的同名备份。
-        # - dns_apply 生成 /etc/resolv.conf.bak.* 和 /etc/systemd/resolved.conf.bak.*
+        # 只删本脚本明确创建的 .bak.* 文件，不用通配符扫全目录，避免误删其他
+        # 软件或用户手工生成的同名备份。
+        # - dns_apply 每次生成 resolv.conf.bak.* / resolved.conf.bak.* 时都会把
+        #   文件名记进 DNS_BACKUP_LOG，这里只删日志里记录过的文件；
+        #   /etc/resolv.conf.bak.* 通配符本身可能匹配到本脚本运行之外产生的
+        #   备份（比如用户或其他工具手动 cp 出来的），不能一并清掉。
         # - sysctl.d 下的 .bak.* 由 bbr_clean/IPv6 autofix 生成，
         #   restore_autofixed_lines 内部会清理 IPV6_AUTOFIX_LOG 记录的行，
         #   bbr_restore_autofixed_lines 也同样；剩余 sysctl.d .bak.* 保留不动。
-        rm -f /etc/resolv.conf.bak.* /etc/systemd/resolved.conf.bak.* 2>/dev/null
+        if [ -f "$DNS_BACKUP_LOG" ]; then
+            while IFS= read -r _bak_f; do
+                [ -n "$_bak_f" ] && rm -f "$_bak_f" 2>/dev/null
+            done < "$DNS_BACKUP_LOG"
+            rm -f "$DNS_BACKUP_LOG"
+        fi
         bbr_remove_initcwnd
         bbr_restore_autofixed_lines
         restore_autofixed_lines "$IPV6_AUTOFIX_LOG"
@@ -2924,6 +2958,10 @@ BBR_INITCWND_SCRIPT="/usr/local/sbin/wot-initcwnd.sh"
 # BBR 和 IPv6 各自独立，避免互相漏恢复。
 BBR_AUTOFIX_LOG="/etc/sing-box/bbr-autofix.log"
 IPV6_AUTOFIX_LOG="/etc/sing-box/ipv6-autofix.log"
+# dns_apply 每次生成 resolv.conf.bak.* / resolved.conf.bak.* 时把文件名追加到这里，
+# 卸载清理时只删日志里记录过的文件，不用通配符扫描整个目录——避免删掉其他
+# 软件或用户手工创建的同名 .bak.* 文件。
+DNS_BACKUP_LOG="/etc/sing-box/dns-backup.log"
 
 # initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
 # 必须用 ip route 单独设置。作用：新连接建立时首波无需等 ACK 就能发送的包数，
@@ -3418,7 +3456,13 @@ dns_apply() {
     mode=$(dns_get_mode)
 
     if [ "$mode" = "systemd-resolved" ]; then
-        [ -f /etc/systemd/resolved.conf ] && cp /etc/systemd/resolved.conf "/etc/systemd/resolved.conf.bak.$(date +%Y%m%d%H%M%S)"
+        if [ -f /etc/systemd/resolved.conf ]; then
+            local _resolved_bak="/etc/systemd/resolved.conf.bak.$(date +%Y%m%d%H%M%S)"
+            cp /etc/systemd/resolved.conf "$_resolved_bak" && {
+                mkdir -p "$(dirname "$DNS_BACKUP_LOG")" 2>/dev/null
+                echo "$_resolved_bak" >> "$DNS_BACKUP_LOG"
+            }
+        fi
         if grep -q "^DNS=" /etc/systemd/resolved.conf 2>/dev/null; then
             sed -i "s/^DNS=.*/DNS=${dns1} ${dns2}/" /etc/systemd/resolved.conf
         elif grep -q "^#DNS=" /etc/systemd/resolved.conf 2>/dev/null; then
@@ -3433,7 +3477,14 @@ dns_apply() {
         systemctl restart systemd-resolved
         green "\n已通过 systemd-resolved 设置 DNS: ${dns1} ${dns2}\n"
     else
-        [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)"
+        local _resolv_bak
+        if [ -f /etc/resolv.conf ]; then
+            _resolv_bak="/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)"
+            cp /etc/resolv.conf "$_resolv_bak" && {
+                mkdir -p "$(dirname "$DNS_BACKUP_LOG")" 2>/dev/null
+                echo "$_resolv_bak" >> "$DNS_BACKUP_LOG"
+            }
+        fi
         cat > /etc/resolv.conf << EOF
 nameserver ${dns1}
 nameserver ${dns2}
