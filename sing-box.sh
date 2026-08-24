@@ -2242,6 +2242,18 @@ manage_extra_protocols() {
                     || { red "备份配置文件失败，已取消删除"; continue; }
                 _del_plist_bak=$(mktemp) && cp "${work_dir}/protocols.list" "$_del_plist_bak" \
                     || { rm -f "$_del_proto_bak"; red "备份协议列表失败，已取消删除"; continue; }
+                # protocols_acme.list 同样需要纳入这次事务：remove_protocol() 内部会调用
+                # _remove_line_from_file 修改它（把被删协议从 acme 列表里摘掉），如果只
+                # 备份/回滚了 inbounds.json 和 protocols.list，restart 失败回滚后会出现
+                # "协议已经恢复，但 acme 列表里仍然少了这个协议"的不一致状态，以后这个
+                # 协议再涉及证书续期/同步判断时会跟实际配置对不上。
+                # 该文件不一定存在（没有协议用过 acme 时不会创建），空值表示"删除前不存在"，
+                # 回滚时据此决定是恢复内容还是直接删掉本次流程中新建出来的文件。
+                local _del_acme_bak=""
+                if [ -f "${work_dir}/protocols_acme.list" ]; then
+                    _del_acme_bak=$(mktemp) && cp "${work_dir}/protocols_acme.list" "$_del_acme_bak" \
+                        || { rm -f "$_del_proto_bak" "$_del_plist_bak"; red "备份 ACME 协议列表失败，已取消删除"; continue; }
+                fi
                 local _del_ports=()  # 记录被删的端口/协议，回滚时重新放行
                 for (( j=0; j<${#del_compact}; j++ )); do
                     c="${del_compact:$j:1}"
@@ -2257,12 +2269,40 @@ manage_extra_protocols() {
                     [ -n "$_dp" ] && [ "$_dp" != "null" ] && _del_ports+=("${_dp}/${_dproto}")
                 done
                 if restart_singbox; then
-                    rm -f "$_del_proto_bak" "$_del_plist_bak"
+                    rm -f "$_del_proto_bak" "$_del_plist_bak" "$_del_acme_bak"
                     get_info
                 else
                     red "\n协议删除后 sing-box 重启失败，正在回滚…"
                     mv "$_del_proto_bak" "${conf_dir}/inbounds.json"
                     mv "$_del_plist_bak" "${work_dir}/protocols.list"
+                    if [ -n "$_del_acme_bak" ]; then
+                        mv "$_del_acme_bak" "${work_dir}/protocols_acme.list"
+                    else
+                        # 备份为空说明这次流程开始前 protocols_acme.list 本就不存在；
+                        # 若删除过程中被新建出来（例如 _remove_line_from_file 之类的
+                        # 实现在文件不存在时可能隐式创建空文件），回滚时应一并去掉，
+                        # 否则会凭空多出一个删除前并不存在的文件。
+                        rm -f "${work_dir}/protocols_acme.list"
+                    fi
+                    # remove_protocol() 删除一个用 acme 的协议时，不只是改 protocols_acme.list，
+                    # 还会顺手清理对应的 acme 续期/同步 cron（该域名不再被任何协议使用时删同步任务，
+                    # protocols_acme.list 清空时删续期检查任务）——这两步都是直接操作 crontab，
+                    # 不在上面几个文件回滚的覆盖范围内。所以配置文件回滚后，这里要按恢复后的
+                    # protocols_acme.list + inbounds.json 重新推导一遍"现在应该有哪些 acme cron"，
+                    # 对每个仍在用 acme 的域名重新调用 _ensure_acme_sync_cron——它本身是幂等的
+                    # （靠 marker 判断是否已存在），已存在则直接跳过，不会产生重复任务，也不会
+                    # 动到用户其他跟 sing-box 无关的 crontab 内容。
+                    if [ -s "${work_dir}/protocols_acme.list" ]; then
+                        local _rb_tag _rb_domain
+                        while IFS= read -r _rb_tag; do
+                            [ -z "$_rb_tag" ] && continue
+                            _rb_domain=$(jq -r --arg t "$_rb_tag" \
+                                '.inbounds[] | select(.tag == $t) | .tls.server_name' \
+                                "${conf_dir}/inbounds.json" 2>/dev/null)
+                            [ -n "$_rb_domain" ] && [ "$_rb_domain" != "null" ] \
+                                && _ensure_acme_sync_cron "$_rb_domain"
+                        done < "${work_dir}/protocols_acme.list"
+                    fi
                     # 恢复防火墙：重新放行被删掉的端口
                     for _rp in "${_del_ports[@]}"; do
                         allow_port "$_rp"
