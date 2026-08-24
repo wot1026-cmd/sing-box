@@ -3528,11 +3528,22 @@ EOF
     local unknown_ports=()
     local addr port proto proc already dup_key is_dup existing
     while IFS= read -r line; do
-        addr=$(echo "$line"  | awk '{print $4}')
+        # 不依赖固定列号（不同 ss/iproute2 版本、不同长度的 Recv-Q/Send-Q
+        # 都可能导致按空格数取列错位），改为用正则精确抓 "本地地址:端口"，
+        # 即紧跟在 State/Recv-Q/Send-Q 之后、Peer Address:Port 之前的那一段。
+        addr=$(echo "$line" | grep -oE '[0-9.]+:[0-9]+[[:space:]]+[0-9*.]+:[0-9*]+' \
+            | awk '{print $1}')
         port=$(echo "$addr"  | grep -oE '[0-9]+$')
         proto=$(echo "$line" | awk '{print $1}' | sed 's/6$//')
         proc=$(echo "$line"  | grep -oE 'users:\(\("[^"]+' \
             | grep -oE '"[^"]+' | tr -d '"')
+
+        # 端口号必须是 1-65535 的合法值，解析异常（如误取到 0 或 Send-Q 列）
+        # 直接跳过，避免生成 --dport 0 这种无意义的防火墙规则
+        if [ -n "$port" ] && { [ "$port" -eq 0 ] || [ "$port" -gt 65535 ]; }; then
+            yellow "  警告：解析到异常端口号 ($port)，跳过该行：$line"
+            continue
+        fi
 
         # 跳过 loopback
         echo "$addr" | grep -qE '^127\.|^\[::1\][:\[]?|^::1[:\[]' && continue
