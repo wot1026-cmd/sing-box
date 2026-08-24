@@ -1528,7 +1528,19 @@ ensure_acme_config() {
 _acme_sh_bin="/root/.acme.sh/acme.sh"
 
 _ensure_acme_sh_installed() {
+    # 标记文件：记录"默认 cron 清理"这一步是否已经做过，避免每次调用本函数
+    # （备用协议里每添加一个用 acme 的协议都会调一次）都去扫一遍 crontab。
+    # 用文件而非只判断 $_acme_sh_bin 是否存在，是因为可执行文件存在只能说明
+    # "acme.sh 装过"，不能说明"默认 cron 清理这一步跑过"——机器上的 acme.sh
+    # 可能是本脚本更早版本（还没有这段清理逻辑时）装的，也可能是用户自己或
+    # 其他项目装的，这两种情况下可执行文件都已存在，但从未清理过默认 cron。
+    local _acme_cron_cleaned_flag="${work_dir}/.acme_default_cron_cleaned"
+
     if [ -x "$_acme_sh_bin" ]; then
+        if [ ! -f "$_acme_cron_cleaned_flag" ]; then
+            _acme_sh_clean_default_cron
+            touch "$_acme_cron_cleaned_flag" 2>/dev/null
+        fi
         return 0
     fi
     yellow "首次使用 acme.sh，正在安装…" >&2
@@ -1569,30 +1581,34 @@ _ensure_acme_sh_installed() {
         return 1
     fi
     rm -f "$_acme_install_log"
-    # install.sh 默认会自动写入一条系统级 crontab（用于每日续期检查），但这条
-    # 任务固定使用默认 --home（/root/.acme.sh），读不到本脚本实际存放证书数据的
-    # 自定义 --home（${work_dir}/.acme.sh），执行了也没用，等同垃圾任务。
-    # 之前是靠传 --nocron 从源头不生成它，现在改为装完后手动清理，效果等价，
-    # 见上方大段注释里对 --nocron 参数解析 bug 的说明。
-    #
-    # 注意：这里必须用 _crontab_remove_matching（安全函数），不能直接写
-    # `crontab -l | grep -v ... | crontab -`。原因见该函数上方注释——crontab -l
-    # 一旦因瞬时异常返回空内容，grep -v 对空输入同样输出空，最终会把整个 root
-    # crontab 静默清空。
-    #
-    # 匹配串不能只用 "acme.sh --cron"：acme.sh 官方 install.sh 给任何一次
-    # 安装写入的系统级 crontab 都会包含这段固定文字，如果这台机器上还有
-    # 其他项目独立装过 acme.sh（哪怕装在别的 --home 目录下），这个粗粒度
-    # 匹配会连带把那些任务也删掉。acme.sh 写入 cron 时用的是它自己可执行
-    # 文件的完整路径来调用 --cron（不同 --home 对应不同路径），而本脚本的
-    # acme.sh 固定装在 $_acme_sh_bin（/root/.acme.sh/acme.sh），因此改为
-    # 匹配这个具体路径，只删本次安装自己写入的那一条，不影响机器上其他
-    # acme.sh 实例的续期任务。
-    if command -v crontab >/dev/null 2>&1; then
-        _crontab_remove_matching "$_acme_sh_bin --cron"
-    fi
+    _acme_sh_clean_default_cron
+    touch "$_acme_cron_cleaned_flag" 2>/dev/null
     green "acme.sh 安装完成" >&2
     return 0
+}
+
+# install.sh 默认会自动写入一条系统级 crontab（用于每日续期检查），但这条
+# 任务固定使用默认 --home（/root/.acme.sh），读不到本脚本实际存放证书数据的
+# 自定义 --home（${work_dir}/.acme.sh），执行了也没用，等同垃圾任务。
+# 之前是靠传 --nocron 从源头不生成它，现在改为装完后手动清理，效果等价，
+# 见上方大段注释里对 --nocron 参数解析 bug 的说明。
+#
+# 注意：这里必须用 _crontab_remove_matching（安全函数），不能直接写
+# `crontab -l | grep -v ... | crontab -`。原因见该函数上方注释——crontab -l
+# 一旦因瞬时异常返回空内容，grep -v 对空输入同样输出空，最终会把整个 root
+# crontab 静默清空。
+#
+# 匹配串不能只用 "acme.sh --cron"：acme.sh 官方 install.sh 给任何一次
+# 安装写入的系统级 crontab 都会包含这段固定文字，如果这台机器上还有
+# 其他项目独立装过 acme.sh（哪怕装在别的 --home 目录下），这个粗粒度
+# 匹配会连带把那些任务也删掉。acme.sh 写入 cron 时用的是它自己可执行
+# 文件的完整路径来调用 --cron（不同 --home 对应不同路径），而本脚本的
+# acme.sh 固定装在 $_acme_sh_bin（/root/.acme.sh/acme.sh），因此改为
+# 匹配这个具体路径，只删本次安装自己写入的那一条，不影响机器上其他
+# acme.sh 实例的续期任务。
+_acme_sh_clean_default_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    _crontab_remove_matching "$_acme_sh_bin --cron"
 }
 
 # 为指定域名申请证书，成功后把证书/私钥安装到 ${work_dir}/acme/<domain>/{cert.pem,key.pem}
