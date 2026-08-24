@@ -1658,11 +1658,21 @@ _read_protocol_creds() {
 
 # 询问是否复用旧凭证；仅在存档存在时才会问，否则静默返回1（走新生成分支）
 # 返回 0 = 复用（调用方自行从 _read_protocol_creds 取值），1 = 重新生成
+#
+# 批量添加会话缓存：同一轮 select_extra_protocols 批量勾选多个协议时，
+# "是否复用旧配置"这个意图选择通常一致（图省事就都复用，想换新就都换新），
+# 第一次问完后缓存到 _reuse_creds_cache，本轮内后续协议直接沿用，不再重复询问。
+# 注意：只缓存"选择意图"，不缓存具体凭证数据——每个协议是否存在旧存档仍各自独立
+# 判断（$old_json 为空则该协议本就没有可复用的东西，直接走新生成，不受缓存影响）。
 _ask_reuse_creds() {
     local tag="$1" proto_name="$2"
     local old_json
     old_json=$(_read_protocol_creds "$tag")
     [ -z "$old_json" ] && return 1
+
+    if [ -n "${_reuse_creds_cache+x}" ]; then
+        return "$_reuse_creds_cache"
+    fi
 
     echo ""
     yellow "检测到 ${proto_name} 之前的配置（UUID/密码/端口），是否复用？"
@@ -1670,8 +1680,10 @@ _ask_reuse_creds() {
     local reuse_choice
     reading "是否复用旧配置？(Y/n，回车默认 Y): " reuse_choice
     if [[ "$reuse_choice" =~ ^[nN]$ ]]; then
+        _reuse_creds_cache=1
         return 1
     fi
+    _reuse_creds_cache=0
     return 0
 }
 
@@ -1696,8 +1708,25 @@ _creds_field_valid() {
 #   返回 0 → acme 可用，标准输出为证书域名
 #   返回 1 → 回退使用自签证书（标准输出为空）
 #   返回 2 → 两者都不可用，调用方应报错并 return 1
+#
+# 批量添加会话缓存：select_extra_protocols 一次勾选多个协议时（如 "13"），
+# TUIC/AnyTLS 若都走 acme，此前会各自完整问一遍"acme/自签"+"是否复用已保存配置"，
+# 而实际这两个问题在同一轮批量操作里答案必然相同（同一份 cf.env）。
+# 缓存写入 _protocol_cert_cache_file（临时文件，不是变量）：调用方通过
+# acme_domain=$(_resolve_protocol_cert) 这种命令替换捕获返回值，命令替换会
+# fork 出子 shell 执行函数体，子 shell 内对普通变量的赋值不会传回父 shell，
+# 用变量做跨调用缓存必然失效——只有写文件才能让状态跨越这层子 shell 边界。
+# select_extra_protocols 在每次进入批量循环前删除该文件；单独从菜单添加
+# 单个协议时文件本就不存在，行为与之前完全一致。
 # =========================================================
 _resolve_protocol_cert() {
+    if [ -n "$_protocol_cert_cache_file" ] && [ -f "$_protocol_cert_cache_file" ]; then
+        local cached_rc cached_domain
+        cached_rc=$(sed -n '1p' "$_protocol_cert_cache_file")
+        cached_domain=$(sed -n '2p' "$_protocol_cert_cache_file")
+        [ -n "$cached_domain" ] && echo "$cached_domain"
+        return "$cached_rc"
+    fi
     local acme_domain
     if ensure_acme_config; then
         acme_domain=$(_read_cf_env_key CF_ACME_DOMAIN)
@@ -1706,13 +1735,16 @@ _resolve_protocol_cert() {
         # （2026-08 DediRock 曾因此触发 Let's Encrypt 限流，参见脚本内相关记录）。
         if _acme_sh_issue_cert "$acme_domain"; then
             echo "$acme_domain"
+            [ -n "$_protocol_cert_cache_file" ] && printf '0\n%s\n' "$acme_domain" > "$_protocol_cert_cache_file"
             return 0
         fi
         yellow "acme 证书申请失败，回退使用自签证书" >&2
     fi
     if [ -f "${work_dir}/cert.pem" ] && [ -f "${work_dir}/private.key" ]; then
+        [ -n "$_protocol_cert_cache_file" ] && printf '1\n\n' > "$_protocol_cert_cache_file"
         return 1
     fi
+    [ -n "$_protocol_cert_cache_file" ] && printf '2\n\n' > "$_protocol_cert_cache_file"
     return 2
 }
 
@@ -2061,6 +2093,15 @@ select_extra_protocols() {
     # 协议数量固定为个位数，序号直接连写即可（如 "13"），仍兼容空格分隔（如 "1 3"）
     local compact="${choices// /}"
     local c idx j
+    # 批量会话缓存初始化（见 _resolve_protocol_cert / _ask_reuse_creds 顶部注释）：
+    # 本轮批量添加中，acme 证书选择和旧凭证复用意图各自第一次询问后缓存，
+    # 同轮内后续协议直接复用，不再重复询问。
+    # acme 缓存必须用临时文件（_resolve_protocol_cert 是通过 $(...) 命令替换调用的，
+    # 子 shell 内变量赋值传不回父 shell）；旧凭证复用缓存用变量即可（_ask_reuse_creds
+    # 是 if 直接调用，不经过子 shell）。
+    unset _reuse_creds_cache
+    _protocol_cert_cache_file=$(mktemp)
+    rm -f "$_protocol_cert_cache_file"  # 只借用一个不会重名的临时路径，文件本身按需生成
     for (( j=0; j<${#compact}; j++ )); do
         c="${compact:$j:1}"
         if ! [[ "$c" =~ ^[0-9]$ ]]; then
@@ -2079,6 +2120,8 @@ select_extra_protocols() {
             anytls)  add_protocol_anytls ;;
         esac
     done
+    rm -f "$_protocol_cert_cache_file"
+    unset _protocol_cert_cache_file _reuse_creds_cache
 
     check_singbox &>/dev/null
     [ $? -ne 2 ] && restart_singbox
