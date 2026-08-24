@@ -2823,19 +2823,9 @@ _do_uninstall_core() {
         rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-wot-proxy-tuning.conf
         # 只删本脚本明确创建的 .bak.* 文件，不用通配符扫全目录，避免误删其他
         # 软件或用户手工生成的同名备份。
-        # - dns_apply 每次生成 resolv.conf.bak.* / resolved.conf.bak.* 时都会把
-        #   文件名记进 DNS_BACKUP_LOG，这里只删日志里记录过的文件；
-        #   /etc/resolv.conf.bak.* 通配符本身可能匹配到本脚本运行之外产生的
-        #   备份（比如用户或其他工具手动 cp 出来的），不能一并清掉。
         # - sysctl.d 下的 .bak.* 由 bbr_clean/IPv6 autofix 生成，
         #   restore_autofixed_lines 内部会清理 IPV6_AUTOFIX_LOG 记录的行，
         #   bbr_restore_autofixed_lines 也同样；剩余 sysctl.d .bak.* 保留不动。
-        if [ -f "$DNS_BACKUP_LOG" ]; then
-            while IFS= read -r _bak_f; do
-                [ -n "$_bak_f" ] && rm -f "$_bak_f" 2>/dev/null
-            done < "$DNS_BACKUP_LOG"
-            rm -f "$DNS_BACKUP_LOG"
-        fi
         bbr_remove_initcwnd
         bbr_restore_autofixed_lines
         restore_autofixed_lines "$IPV6_AUTOFIX_LOG"
@@ -3061,14 +3051,6 @@ BBR_INITCWND_SCRIPT="/usr/local/sbin/wot-initcwnd.sh"
 # BBR 和 IPv6 各自独立，避免互相漏恢复。
 BBR_AUTOFIX_LOG="/etc/sing-box/bbr-autofix.log"
 IPV6_AUTOFIX_LOG="/etc/sing-box/ipv6-autofix.log"
-# dns_apply 每次生成 resolv.conf.bak.* / resolved.conf.bak.* 时把文件名追加到这里，
-# 卸载清理时只删日志里记录过的文件，不用通配符扫描整个目录——避免删掉其他
-# 软件或用户手工创建的同名 .bak.* 文件。
-DNS_BACKUP_LOG="/etc/sing-box/dns-backup.log"
-# dns_clear_link_overrides 每次清理掉某张网卡的链路层 DNS 覆盖时，记一行
-# "时间戳<TAB>网卡列表" 到这里，纯粹是留痕方便用户/排查时回溯，不用于自动恢复
-# （链路层覆盖通常来自 DHCP/NetworkManager，脚本不保存原始值，也不负责替它恢复）。
-DNS_LINK_OVERRIDE_LOG="/etc/sing-box/dns-link-override.log"
 
 # initcwnd/initrwnd 是路由属性，不是 sysctl 参数，写不进 BBR_CONF 那份 sysctl.d 文件里，
 # 必须用 ip route 单独设置。作用：新连接建立时首波无需等 ACK 就能发送的包数，
@@ -3536,187 +3518,6 @@ bbr_clean() {
     yellow "\n如发现异常，可用对应的 .bak.时间戳 文件手动恢复。\n"
     return 0
 }
-# ── DNS 管理 ──────────────────────────────────
-dns_get_mode() {
-    local target
-    target=$(readlink -f /etc/resolv.conf 2>/dev/null)
-    if [[ "$target" == *"systemd/resolve"* ]]; then
-        echo "systemd-resolved"
-    else
-        echo "static"
-    fi
-}
-
-dns_get_status() {
-    local mode="$1"
-    if [ "$mode" = "systemd-resolved" ]; then
-        resolvectl status 2>/dev/null | grep -A2 "Current DNS Server\|DNS Servers" | head -6
-        dns_warn_remaining_link_overrides
-    else
-        grep "^nameserver" /etc/resolv.conf 2>/dev/null
-    fi
-}
-
-# ── 提示仍然存在的链路层 DNS 覆盖 ──────────────────
-# dns_apply 里的 dns_clear_link_overrides 会在"设置 DNS"这个动作发生时主动
-# revert 一次，但如果 revert 因权限/版本差异等原因失败，或者用户此后又通过
-# NetworkManager/DHCP 重新拿到了链路层 DNS，仅在设置那一刻提示一次是不够的
-# ——用户随后查看"当前生效DNS"（dns_menu 里查看状态、每次 dns_apply 结束时）
-# 也应该能看到这个提示，而不是误以为全局设置就是最终生效值。
-# 只提示、不自动处理：这里是"查看状态"路径，静默改动网卡配置不合适。
-dns_warn_remaining_link_overrides() {
-    command -v resolvectl >/dev/null 2>&1 || return 0
-    local ifaces iface link_dns found=()
-    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
-    [ -z "$ifaces" ] && return 0
-    for iface in $ifaces; do
-        link_dns=$(resolvectl dns "$iface" 2>/dev/null | sed "s/^Link [0-9]*[[:space:]]*(${iface})[[:space:]]*:[[:space:]]*//")
-        link_dns=$(echo "$link_dns" | tr -d '[:space:]')
-        [ -n "$link_dns" ] && found+=("$iface")
-    done
-    if [ ${#found[@]} -gt 0 ]; then
-        yellow "注意：以下网卡当前仍存在链路层 DNS 覆盖，可能导致实际生效的 DNS 与上方全局设置不一致：${found[*]}"
-        yellow "可手动执行 resolvectl revert <网卡名> 清除，或重新进入本菜单设置 DNS 以再次尝试清理。"
-    fi
-}
-
-# ── 清理 systemd-resolved 链路层 DNS 覆盖 ──────────
-# 背景：systemd-resolved 下，per-link DNS（曾用 `resolvectl dns <网卡> ...`
-# 单独配置过、或由 NetworkManager/networkd 通过 DHCP 下发到某张网卡的 DNS）
-# 优先级高于 [Resolve] 里的全局 DNS=。dns_apply 之前只改全局配置、重启服务，
-# 但如果某张网卡存在链路层覆盖，`resolvectl status` 该网卡下依然会显示旧
-# DNS，全局设置形同虚设——用户会遇到"菜单里改了，但没真正生效"的情况，
-# 且脚本此前不会有任何提示。
-#
-# 这里在设置全局 DNS 之后，检测每张网卡是否存在非空的 per-link DNS，若有，
-# 用 `resolvectl revert <iface>` 清掉该网卡的链路层覆盖，让它重新落回全局
-# 设置生效。记录被清理过的网卡到 DNS_LINK_OVERRIDE_LOG，便于用户或后续
-# 排查时知道动过哪些网卡（revert 本身不承诺可逆——原始 per-link 值不会被
-# 脚本保存下来，因为它通常来自 DHCP/NetworkManager 等外部来源，重新走一次
-# DHCP 续租或重启对应服务通常就能拿回来；这里的目的是让菜单里选的 DNS
-# 真正生效，而不是完整可逆的备份）。
-dns_clear_link_overrides() {
-    command -v resolvectl >/dev/null 2>&1 || return 0
-
-    local ifaces iface link_dns cleared=()
-    # 遍历 /sys/class/net 下真实存在的网卡（排除 lo），对每一张调用
-    # `resolvectl dns <iface>`：非空输出即视为存在链路层 DNS 覆盖。
-    # 用 status 里的 "Current Scopes"/"Link" 段做判断在不同版本 resolvectl
-    # 输出格式不一致，不够可靠，这里改用更直接的 `resolvectl dns <iface>`。
-    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
-    [ -z "$ifaces" ] && return 0
-
-    for iface in $ifaces; do
-        link_dns=$(resolvectl dns "$iface" 2>/dev/null | sed "s/^Link [0-9]*[[:space:]]*(${iface})[[:space:]]*:[[:space:]]*//")
-        link_dns=$(echo "$link_dns" | tr -d '[:space:]')
-        if [ -n "$link_dns" ]; then
-            if resolvectl revert "$iface" >/dev/null 2>&1; then
-                cleared+=("$iface")
-            fi
-        fi
-    done
-
-    if [ ${#cleared[@]} -gt 0 ]; then
-        mkdir -p "$(dirname "$DNS_LINK_OVERRIDE_LOG")" 2>/dev/null
-        printf '%s\t%s\n' "$(date +%Y%m%d%H%M%S)" "${cleared[*]}" >> "$DNS_LINK_OVERRIDE_LOG"
-        yellow "检测到以下网卡存在链路层 DNS 覆盖，已清除以确保全局 DNS 生效：${cleared[*]}"
-        yellow "（该覆盖通常来自 DHCP/NetworkManager 下发，如后续网络重连/续租，可能会被重新下发覆盖全局设置）"
-    fi
-}
-
-dns_apply() {
-    # $1 = 主DNS, $2 = 备用DNS
-    local dns1="$1" dns2="$2"
-    local mode
-    mode=$(dns_get_mode)
-
-    if [ "$mode" = "systemd-resolved" ]; then
-        if [ -f /etc/systemd/resolved.conf ]; then
-            local _resolved_bak="/etc/systemd/resolved.conf.bak.$(date +%Y%m%d%H%M%S)"
-            cp /etc/systemd/resolved.conf "$_resolved_bak" && {
-                mkdir -p "$(dirname "$DNS_BACKUP_LOG")" 2>/dev/null
-                echo "$_resolved_bak" >> "$DNS_BACKUP_LOG"
-            }
-        fi
-        if grep -q "^DNS=" /etc/systemd/resolved.conf 2>/dev/null; then
-            sed -i "s/^DNS=.*/DNS=${dns1} ${dns2}/" /etc/systemd/resolved.conf
-        elif grep -q "^#DNS=" /etc/systemd/resolved.conf 2>/dev/null; then
-            sed -i "s/^#DNS=.*/DNS=${dns1} ${dns2}/" /etc/systemd/resolved.conf
-        else
-            if grep -q "^\[Resolve\]" /etc/systemd/resolved.conf 2>/dev/null; then
-                echo "DNS=${dns1} ${dns2}" >> /etc/systemd/resolved.conf
-            else
-                printf '\n[Resolve]\nDNS=%s %s\n' "${dns1}" "${dns2}" >> /etc/systemd/resolved.conf
-            fi
-        fi
-        systemctl restart systemd-resolved
-        # 全局配置重启生效之后再清链路层覆盖：如果顺序反过来，中间会有一段
-        # 窗口——网卡的链路层覆盖已被清掉，但 resolved 还没重启加载新的全局
-        # 配置——该网卡可能短暂丢失所有 DNS。放在 restart 之后，revert 时
-        # 网卡能立刻落回刚生效的新全局 DNS。
-        dns_clear_link_overrides
-        green "\n已通过 systemd-resolved 设置 DNS: ${dns1} ${dns2}\n"
-    else
-        local _resolv_bak
-        if [ -f /etc/resolv.conf ]; then
-            _resolv_bak="/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)"
-            cp /etc/resolv.conf "$_resolv_bak" && {
-                mkdir -p "$(dirname "$DNS_BACKUP_LOG")" 2>/dev/null
-                echo "$_resolv_bak" >> "$DNS_BACKUP_LOG"
-            }
-        fi
-        cat > /etc/resolv.conf << EOF
-nameserver ${dns1}
-nameserver ${dns2}
-EOF
-        green "\n已直接写入 /etc/resolv.conf，DNS: ${dns1} ${dns2}\n"
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-                yellow "检测到 NetworkManager 正在运行，它可能在下次网络重连/DHCP续租时覆盖 /etc/resolv.conf，如发现DNS又变回去，请在 NetworkManager 里单独设置DNS。"
-            elif systemctl is-active --quiet systemd-networkd 2>/dev/null; then
-                yellow "检测到 systemd-networkd 正在运行，它可能在下次网络重连时覆盖 /etc/resolv.conf，如发现DNS又变回去，请改用 systemd-resolved 模式或在 networkd 配置里单独设置DNS。"
-            fi
-        fi
-    fi
-    echo ""
-    yellow "当前生效DNS："
-    dns_get_status "$mode"
-}
-
-dns_menu() {
-    clear; echo ""
-    purple "=== DNS 管理 ===\n"
-    local mode
-    mode=$(dns_get_mode)
-    green "当前模式: ${mode}"
-    yellow "当前DNS配置："
-    dns_get_status "$mode"
-    echo ""
-    green  "1. 设为 Google DNS (8.8.8.8 / 8.8.4.4)"
-    green  "2. 设为 Cloudflare DNS (1.1.1.1 / 1.0.0.1)"
-    green  "3. 混合 DNS (1.1.1.1 主 + 8.8.8.8 备，双运营商容灾)"
-    green  "4. 自定义 DNS"
-    purple "0. 返回主菜单"
-    skyblue "————"
-    reading "\n请输入选择: " choice
-    case "$choice" in
-        1) dns_apply "8.8.8.8" "8.8.4.4"; return 0 ;;
-        2) dns_apply "1.1.1.1" "1.0.0.1"; return 0 ;;
-        3) dns_apply "1.1.1.1" "8.8.8.8"; return 0 ;;
-        4)
-            reading "请输入主DNS: " d1
-            reading "请输入备用DNS: " d2
-            if [[ ! "$d1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$d2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                red "IP格式不正确"
-                return 0
-            fi
-            dns_apply "$d1" "$d2"
-            return 0
-            ;;
-        0) return 1 ;;
-        *) red "无效选项"; return 0 ;;
-    esac
-}
 
 bbr_tune_menu() {
     clear; echo ""
@@ -3765,9 +3566,8 @@ menu() {
     purple "10. SSH 综合工具箱"
     purple "11. SSH 防护 (fail2ban)"
     purple "12. 网络调优 (BBR)"
-    purple "13. DNS 管理"
     echo   "==============="
-    green  "14. 备用协议管理 (TUIC/Reality/AnyTLS)"
+    green  "13. 备用协议管理 (TUIC/Reality/AnyTLS)"
     echo   "==============="
     red    "0. 退出脚本"
     echo   "==========="
@@ -4253,7 +4053,7 @@ case "$1" in
     "")
         while true; do
             menu
-            reading "请输入选择(0-14): " choice
+            reading "请输入选择(0-13): " choice
             echo ""
             need_pause=true
             case "$choice" in
@@ -4293,13 +4093,10 @@ case "$1" in
                     if bbr_tune_menu; then need_pause=true; else need_pause=false; fi
                     ;;
                 13)
-                    if dns_menu; then need_pause=true; else need_pause=false; fi
-                    ;;
-                14)
                     if manage_extra_protocols; then need_pause=true; else need_pause=false; fi
                     ;;
                 0) exit 0 ;;
-                *) red "无效选项，请输入 0-14" ;;
+                *) red "无效选项，请输入 0-13" ;;
             esac
             [ "$need_pause" = true ] && { read -n1 -s -r -p $'\033[1;91m按任意键返回…\033[0m' || exit 0; }
             echo ""
