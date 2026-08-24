@@ -1466,23 +1466,33 @@ _ensure_acme_sh_installed() {
     # 不传 email 参数：acme.sh 官方文档确认该参数默认即为空，不是必需项。
     # 曾尝试用 hostname -f 拼邮箱，但多数云 VPS 的 hostname -f 只返回短主机名（如 "74"），
     # 拼出的 "acme@74" 不是合法邮箱格式，可能导致 CA 账号注册被拒——不传更安全。
-    local _acme_installer
+    local _acme_installer _acme_install_log
     _acme_installer=$(mktemp)
+    _acme_install_log=$(mktemp)
     if ! curl -fsSL https://get.acme.sh -o "$_acme_installer" 2>/dev/null; then
         red "acme.sh 安装脚本下载失败，请检查网络" >&2
-        rm -f "$_acme_installer"
+        rm -f "$_acme_installer" "$_acme_install_log"
         return 1
     fi
-    if ! sh "$_acme_installer" --nocron >/dev/null 2>&1; then
-        red "acme.sh 安装失败" >&2
-        rm -f "$_acme_installer"
+    # 官方安装脚本会读取当前 $HOME 决定安装目录（装到 $HOME/.acme.sh），
+    # 而本脚本读取可执行文件用的是写死的 /root/.acme.sh/acme.sh —— 如果调用
+    # 环境的 $HOME 不是 /root（部分 su/sudo/容器场景可能出现），两边路径就会
+    # 对不上，导致"装是装了，但在预期路径找不到"。显式锚定 HOME=/root 消除这个隐患。
+    if ! HOME=/root sh "$_acme_installer" --nocron >"$_acme_install_log" 2>&1; then
+        red "acme.sh 安装失败，详情：" >&2
+        tail -n 20 "$_acme_install_log" >&2
+        rm -f "$_acme_installer" "$_acme_install_log"
         return 1
     fi
     rm -f "$_acme_installer"
     if [ ! -x "$_acme_sh_bin" ]; then
         red "acme.sh 安装后未找到可执行文件：${_acme_sh_bin}" >&2
+        red "安装脚本输出（可能提示了实际安装位置）：" >&2
+        tail -n 20 "$_acme_install_log" >&2
+        rm -f "$_acme_install_log"
         return 1
     fi
+    rm -f "$_acme_install_log"
     green "acme.sh 安装完成" >&2
     return 0
 }
