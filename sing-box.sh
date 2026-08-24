@@ -437,8 +437,12 @@ install_singbox() {
                 hy2_port=$(pick_free_udp_port) || { _install_singbox_rollback; return 1; }
             fi
             if _port_in_use "$argo_port" tcp; then
-                yellow "备份中的 VLESS-Argo 端口 ${argo_port} 已被占用，将使用默认端口 ${ARGO_PORT}"
-                argo_port="${ARGO_PORT}"
+                yellow "备份中的 VLESS-Argo 端口 ${argo_port} 已被占用，正在重新分配 TCP 端口"
+                # 不能直接回退到固定的 ${ARGO_PORT}：那只是个写死的默认值
+                # （常量 "8001"），没有理由保证它一定空闲——如果它也被占用，
+                # 会把一个同样冲突的端口写进 inbounds.json。改用和 Hy2 分支
+                # 一致的做法，动态挑一个当前确认空闲的 TCP 端口。
+                argo_port=$(pick_free_tcp_port) || { _install_singbox_rollback; return 1; }
             fi
             green "已从备份恢复 UUID 与端口配置"
         fi
