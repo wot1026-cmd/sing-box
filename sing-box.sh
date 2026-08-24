@@ -1414,16 +1414,12 @@ ensure_acme_config() {
     fi
 
     if $has_saved_cfg; then
-        echo "" >&2
-        yellow "检测到已保存的 acme 配置（域名：${domain}），是否直接复用？" >&2
-        local reuse_acme
-        reading "是否复用已保存的域名/Token/Zone ID？(Y/n，回车默认 Y): " reuse_acme
-        if ! [[ "$reuse_acme" =~ ^[nN]$ ]]; then
-            return 0
-        fi
-        # 选择不复用：清空局部变量，走下面的重新输入分支，
-        # 输入完成后会用新值覆盖 cf.env 里的旧值。
-        token=""; domain=""; zone_id=""
+        # 已保存过完整配置（token/domain/zone_id 三项齐全）时静默复用，不再多问一次——
+        # 用户已经在上面 1/2 里明确选了"要用 acme"，既然配置本来就在，没必要每次
+        # 再确认一遍是否复用同一份。如需切换到新域名/Token，走管理菜单的
+        # "e. 清除 acme 配置"手动清除后重新添加即可触发下面的手动输入分支。
+        green "检测到已保存的 acme 配置（域名：${domain}），自动复用" >&2
+        return 0
     fi
 
     reading "请输入用于该协议的子域名（如 node1.yourdomain.com，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
@@ -1660,30 +1656,15 @@ _read_protocol_creds() {
 # 返回 0 = 复用（调用方自行从 _read_protocol_creds 取值），1 = 重新生成
 #
 # 批量添加会话缓存：同一轮 select_extra_protocols 批量勾选多个协议时，
-# "是否复用旧配置"这个意图选择通常一致（图省事就都复用，想换新就都换新），
-# 第一次问完后缓存到 _reuse_creds_cache，本轮内后续协议直接沿用，不再重复询问。
-# 注意：只缓存"选择意图"，不缓存具体凭证数据——每个协议是否存在旧存档仍各自独立
-# 判断（$old_json 为空则该协议本就没有可复用的东西，直接走新生成，不受缓存影响）。
+# 检测到旧凭证存档（UUID/密码/端口）时静默复用，不再询问——用户已经明确
+# 表达过要保留节点身份（否则不会有存档存在）。如需重新生成全新凭证，
+# 走管理菜单的"c. 清除旧配置存档"手动清除后重新添加即可。
 _ask_reuse_creds() {
     local tag="$1" proto_name="$2"
     local old_json
     old_json=$(_read_protocol_creds "$tag")
     [ -z "$old_json" ] && return 1
-
-    if [ -n "${_reuse_creds_cache+x}" ]; then
-        return "$_reuse_creds_cache"
-    fi
-
-    echo ""
-    yellow "检测到 ${proto_name} 之前的配置（UUID/密码/端口），是否复用？"
-    yellow "复用可避免客户端重新导入链接；选择重新生成则视为全新节点。"
-    local reuse_choice
-    reading "是否复用旧配置？(Y/n，回车默认 Y): " reuse_choice
-    if [[ "$reuse_choice" =~ ^[nN]$ ]]; then
-        _reuse_creds_cache=1
-        return 1
-    fi
-    _reuse_creds_cache=0
+    green "检测到 ${proto_name} 之前的配置（UUID/密码/端口），自动复用" >&2
     return 0
 }
 
@@ -2093,13 +2074,12 @@ select_extra_protocols() {
     # 协议数量固定为个位数，序号直接连写即可（如 "13"），仍兼容空格分隔（如 "1 3"）
     local compact="${choices// /}"
     local c idx j
-    # 批量会话缓存初始化（见 _resolve_protocol_cert / _ask_reuse_creds 顶部注释）：
-    # 本轮批量添加中，acme 证书选择和旧凭证复用意图各自第一次询问后缓存，
-    # 同轮内后续协议直接复用，不再重复询问。
-    # acme 缓存必须用临时文件（_resolve_protocol_cert 是通过 $(...) 命令替换调用的，
-    # 子 shell 内变量赋值传不回父 shell）；旧凭证复用缓存用变量即可（_ask_reuse_creds
-    # 是 if 直接调用，不经过子 shell）。
-    unset _reuse_creds_cache
+    # acme 证书选择（1/2 + 域名/Token/Zone ID）的批量会话缓存（见 _resolve_protocol_cert
+    # 顶部注释）：本轮批量添加中，TUIC/AnyTLS 若都走 acme，第一个协议问完 1/2 之后
+    # 缓存结果，同轮内后续协议直接复用，不再重复问。必须用临时文件而非变量——
+    # _resolve_protocol_cert 是通过 $(...) 命令替换调用的，子 shell 内变量赋值传不回父 shell。
+    # 旧凭证复用（UUID/密码/端口）已改为只要存档存在就静默复用，不再询问，
+    # 故不再需要类似缓存。
     _protocol_cert_cache_file=$(mktemp)
     rm -f "$_protocol_cert_cache_file"  # 只借用一个不会重名的临时路径，文件本身按需生成
     for (( j=0; j<${#compact}; j++ )); do
@@ -2121,7 +2101,7 @@ select_extra_protocols() {
         esac
     done
     rm -f "$_protocol_cert_cache_file"
-    unset _protocol_cert_cache_file _reuse_creds_cache
+    unset _protocol_cert_cache_file
 
     check_singbox &>/dev/null
     [ $? -ne 2 ] && restart_singbox
