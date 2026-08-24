@@ -3694,14 +3694,16 @@ dns_menu() {
     echo ""
     green  "1. 设为 Google DNS (8.8.8.8 / 8.8.4.4)"
     green  "2. 设为 Cloudflare DNS (1.1.1.1 / 1.0.0.1)"
-    green  "3. 自定义 DNS"
+    green  "3. 混合 DNS (1.1.1.1 主 + 8.8.8.8 备，双运营商容灾)"
+    green  "4. 自定义 DNS"
     purple "0. 返回主菜单"
     skyblue "————"
     reading "\n请输入选择: " choice
     case "$choice" in
         1) dns_apply "8.8.8.8" "8.8.4.4"; return 0 ;;
         2) dns_apply "1.1.1.1" "1.0.0.1"; return 0 ;;
-        3)
+        3) dns_apply "1.1.1.1" "8.8.8.8"; return 0 ;;
+        4)
             reading "请输入主DNS: " d1
             reading "请输入备用DNS: " d2
             if [[ ! "$d1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$d2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
