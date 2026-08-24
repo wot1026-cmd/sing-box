@@ -3531,21 +3531,16 @@ EOF
         # 不依赖固定列号（不同 ss/iproute2 版本、不同长度的 Recv-Q/Send-Q
         # 都可能导致按空格数取列错位），改为用正则精确抓 "本地地址:端口"，
         # 即紧跟在 State/Recv-Q/Send-Q 之后、Peer Address:Port 之前的那一段。
-        addr=$(echo "$line" | grep -oE '[0-9.]+:[0-9]+[[:space:]]+[0-9*.]+:[0-9*]+' \
+        # 地址段可能带 %接口名（如 127.0.0.53%lo:53）或是 [ipv6]:port，
+        # 用 [^[:space:]]+ 兜住这些变体，只靠冒号+纯数字端口来锚定末尾。
+        addr=$(echo "$line" | grep -oE '[^[:space:]]+:[0-9]+[[:space:]]+[^[:space:]]+:[0-9*]+' \
             | awk '{print $1}')
         port=$(echo "$addr"  | grep -oE '[0-9]+$')
         proto=$(echo "$line" | awk '{print $1}' | sed 's/6$//')
         proc=$(echo "$line"  | grep -oE 'users:\(\("[^"]+' \
             | grep -oE '"[^"]+' | tr -d '"')
 
-        # 端口号必须是 1-65535 的合法值，解析异常（如误取到 0 或 Send-Q 列）
-        # 直接跳过，避免生成 --dport 0 这种无意义的防火墙规则
-        if [ -n "$port" ] && { [ "$port" -eq 0 ] || [ "$port" -gt 65535 ]; }; then
-            yellow "  警告：解析到异常端口号 ($port)，跳过该行：$line"
-            continue
-        fi
-
-        # 跳过 loopback
+        # 跳过 loopback（含 127.x.x.x、127.x.x.x%接口名、::1）
         echo "$addr" | grep -qE '^127\.|^\[::1\][:\[]?|^::1[:\[]' && continue
         # 跳过 IPv6 监听（反正全 DROP 了）
         echo "$addr" | grep -qE '^\[' && continue
@@ -3554,6 +3549,13 @@ EOF
 
         if [ -z "$port" ]; then
             yellow "  警告：无法解析端口，跳过：$line"
+            continue
+        fi
+
+        # 端口号必须是 1-65535 的合法值，解析异常（如误取到 Send-Q 列的 0）
+        # 直接跳过，避免生成 --dport 0 这种无意义的防火墙规则
+        if [ "$port" -eq 0 ] || [ "$port" -gt 65535 ]; then
+            yellow "  警告：解析到异常端口号 ($port)，跳过该行：$line"
             continue
         fi
 
