@@ -16,6 +16,10 @@ yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue(){ echo -e "\e[1;36m$1\033[0m"; }
 reading(){ read -p "$(red "$1")" "$2" || exit 1; }
+# 用法同 reading，但输入不回显（Token/密钥等敏感信息用这个，避免明文留在
+# 终端 scrollback / 录屏 / 共享终端场景中）。read -s 结束后终端不会自动换行，
+# 这里补一个换行，避免下一行输出紧贴在光标后面。
+reading_silent(){ read -s -p "$(red "$1")" "$2" || exit 1; echo; }
 
 # ── 常量 ──────────────────────────────────────────
 work_dir="/etc/sing-box"
@@ -65,6 +69,38 @@ _crontab_remove_matching() {
     grep -vF "$pattern" <<< "$existing" | crontab - 2>/dev/null
 }
 
+# ── crontab 安全追加 ──────────────────────────────
+# 用法：_crontab_append_line <新的一整行 cron 内容>
+# 同样的风险在追加路径也存在：`(crontab -l; echo "...") | crontab -` 若
+# crontab -l 因瞬时异常（锁竞争等）失败但仍返回空标准输出而非非零退出码，
+# 子 shell 里就只剩新追加的这一行，等于把用户原有的其他 crontab 任务全部
+# 静默覆盖删除。
+#
+# 注意：crontab -l 在该用户"从未有过 crontab"时也会返回非 0（不同实现
+# 提示语不同，如 "no crontab for root" / "not found" / "cannot open"），
+# 这是完全正常的初始状态，不能等同于读取异常——否则会导致没有 crontab
+# 的机器上，本函数永远追加不进任何任务（这类机器恰恰最常见于全新部署
+# 的场景）。这里通过匹配 stderr 里几种常见的"无 crontab"提示词，将其
+# 与真正的读取异常区分开：命中则视为空列表继续追加；未命中的意外错误
+# 才按原则放弃写入（跳过最坏情况是没加成，写回最坏情况是清空所有任务，
+# 两者不对等，优先选跳过）。
+_crontab_append_line() {
+    local new_line="$1" existing ret errmsg tmp_out
+    tmp_out=$(mktemp 2>/dev/null) || return 1
+    errmsg=$(crontab -l 2>&1 1>"$tmp_out")
+    ret=$?
+    existing=$(cat "$tmp_out" 2>/dev/null)
+    rm -f "$tmp_out"
+    if [ "$ret" -ne 0 ]; then
+        if echo "$errmsg" | grep -qiE "no crontab|not found for|cannot open|no such file"; then
+            existing=""
+        else
+            return 1
+        fi
+    fi
+    { [ -n "$existing" ] && printf '%s\n' "$existing"; printf '%s\n' "$new_line"; } | crontab - 2>/dev/null
+}
+
 # ── 服务状态检查 ───────────────────────────────────
 check_service() {
     local name="$1" binary="$2"
@@ -80,13 +116,28 @@ check_singbox() { check_service "sing-box" "${work_dir}/sing-box"; }
 check_argo()    { check_service "argo"     "${work_dir}/argo"; }
 
 # ── 安装失败回滚 ───────────────────────────────────
-# install_singbox 中途失败时调用：删除已落盘的 sing-box 二进制，
-# 让 check_singbox 重新返回"未安装"(2)，避免用户卡在"半安装"状态
-# 无法通过菜单重装；同时清理该次安装已放行的 hy2 防火墙规则，
+# install_singbox 中途失败时调用：删除已落盘的 sing-box/argo 二进制，
+# 让 check_singbox/check_argo 重新返回"未安装"，避免用户卡在"半安装"
+# 状态无法通过菜单重装；同时清理该次安装已放行的 hy2 防火墙规则，
 # 避免留下孤儿规则。
+# 用法：_install_singbox_rollback [hy2_port] [清理新生成的证书=true/false] [清理conf下的json=true/false]
+# 第二个参数默认 false：证书可能是从 backup_dir 恢复的，不能无差别删除，
+# 只有调用方明确知道这次是"全新生成证书后才失败"时才传 true。
+# 第三个参数默认 false：conf_dir 下的 json 只有在本次安装流程已经开始
+# 写入之后失败才该清理——下载二进制/选端口/生成证书这几个更早的失败点，
+# conf_dir 里如果有内容，只可能是上一次半损坏安装遗留的旧配置，跟本次
+# 安装无关，不该被这次失败连带清空；只有调用方明确知道这次是"json 写入
+# 阶段失败"时才传 true。
 _install_singbox_rollback() {
-    local hy2_port="${1:-}"
+    local hy2_port="${1:-}" clean_cert="${2:-false}" clean_conf="${3:-false}"
     rm -f "${work_dir}/sing-box"
+    rm -f "${work_dir}/argo"
+    if [ "$clean_conf" = true ]; then
+        rm -f "${conf_dir}"/*.json 2>/dev/null
+    fi
+    if [ "$clean_cert" = true ]; then
+        rm -f "${work_dir}/cert.pem" "${work_dir}/private.key"
+    fi
     if [ -n "$hy2_port" ] && [ "$hy2_port" != "null" ]; then
         remove_port "${hy2_port}/udp" 2>/dev/null
     fi
@@ -143,7 +194,12 @@ _persist_iptables_rules() {
 # ── 防火墙放行 ────────────────────────────────────
 allow_port() {
     local has_ufw=0 has_iptables=0 has_ip6tables=0
-    command_exists ufw       && has_ufw=1
+    # 只有 ufw 处于 active 状态才当作"这台机器由 ufw 管理"；
+    # 仅仅 command_exists ufw（装了但未启用/已被 setup_firewall_base
+    # 统一交给 iptables 管理）不应该触发对 ufw 全局策略的修改——
+    # 否则每次调用本函数都会静默把 ufw 默认出站策略改成 allow，
+    # 属于跟当前防火墙管理方式不符的隐蔽副作用。
+    command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active" && has_ufw=1
     command_exists iptables  && has_iptables=1
     command_exists ip6tables && has_ip6tables=1
 
@@ -168,7 +224,9 @@ allow_port() {
 # ── 防火墙删除旧规则 ──────────────────────────────
 remove_port() {
     local has_ufw=0 has_iptables=0 has_ip6tables=0
-    command_exists ufw       && has_ufw=1
+    # 判断标准与 allow_port 保持一致：只有 ufw 处于 active 状态才当作
+    # "这台机器由 ufw 管理"，避免两个配对函数用不同标准判定同一件事。
+    command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active" && has_ufw=1
     command_exists iptables  && has_iptables=1
     command_exists ip6tables && has_ip6tables=1
 
@@ -414,18 +472,18 @@ install_singbox() {
         yellow "正在生成新 TLS 证书..."
         if ! openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" 2>/dev/null; then
             red "生成私钥失败（磁盘空间/权限/OpenSSL异常），已中止"
-            _install_singbox_rollback "$hy2_port"; return 1
+            _install_singbox_rollback "$hy2_port" true; return 1
         fi
         if ! openssl req -new -x509 -days 3650 \
             -key "${work_dir}/private.key" \
             -out "${work_dir}/cert.pem" \
             -subj "/CN=bing.com" 2>/dev/null; then
             red "生成自签证书失败，已中止"
-            _install_singbox_rollback "$hy2_port"; return 1
+            _install_singbox_rollback "$hy2_port" true; return 1
         fi
         if [ ! -s "${work_dir}/private.key" ] || [ ! -s "${work_dir}/cert.pem" ]; then
             red "TLS 证书或私钥文件为空，生成异常，已中止"
-            _install_singbox_rollback "$hy2_port"; return 1
+            _install_singbox_rollback "$hy2_port" true; return 1
         fi
         chmod 600 "${work_dir}/private.key"
     fi
@@ -440,7 +498,7 @@ install_singbox() {
   }
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/ntp.json" << 'EOF'
 {
@@ -452,7 +510,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/dns.json" << 'EOF'
 {
@@ -462,7 +520,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/inbounds.json" << EOF
 {
@@ -504,7 +562,7 @@ EOF
   ]
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/outbounds.json" << 'EOF'
 {
@@ -514,7 +572,7 @@ EOF
   ]
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/route.json" << 'EOF'
 {
@@ -525,7 +583,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     write_json_atomic "${conf_dir}/experimental.json" << EOF
 {
@@ -537,7 +595,7 @@ EOF
   }
 }
 EOF
-    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port"; return 1; }
+    [ $? -eq 0 ] || { _install_singbox_rollback "$hy2_port" false true; return 1; }
 
     # ── 恢复 Argo 隧道与 CF 优选配置（若有备份）──
     if $restore_backup; then
@@ -1346,7 +1404,7 @@ ensure_acme_config() {
         yellow "域名格式不合法，回退使用自签证书"
         return 1
     fi
-    reading "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名）: " token
+    reading_silent "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名，输入不回显）: " token
     if [ -z "$token" ]; then
         yellow "Token 为空，回退使用自签证书"
         return 1
@@ -1484,7 +1542,8 @@ _ensure_acme_sync_cron() {
     local renew_marker="# sing-box-extra-protocols acme renew-check"
     if ! crontab -l 2>/dev/null | grep -qF "$renew_marker"; then
         local renew_cmd="[ -d '${work_dir}' ] || exit 0; '${_acme_sh_bin}' --cron --home '${work_dir}/.acme.sh' >>'${work_dir}/acme.log' 2>&1"
-        (crontab -l 2>/dev/null; echo "33 3 * * * ${renew_cmd} ${renew_marker}") | crontab -
+        _crontab_append_line "33 3 * * * ${renew_cmd} ${renew_marker}" \
+            || yellow "读取现有 crontab 失败，已跳过本次续期检查任务注册（不会清空现有任务，可稍后重试）"
     fi
 
     # 2) 证书同步任务：按域名单独注册（不同协议若共用同一域名，第二次调用会因 marker 已存在而跳过）
@@ -1494,7 +1553,8 @@ _ensure_acme_sync_cron() {
     fi
     local cert_dir="${work_dir}/acme/${domain}"
     local sync_cmd="[ -d '${work_dir}' ] || exit 0; CF_Token=\$(grep '^CF_ACME_TOKEN=' '${work_dir}/cf.env' | cut -d'=' -f2-) CF_Zone_ID=\$(grep '^CF_ACME_ZONE_ID=' '${work_dir}/cf.env' | cut -d'=' -f2-) '${_acme_sh_bin}' --install-cert -d '${domain}' --home '${work_dir}/.acme.sh' --key-file '${cert_dir}/key.pem' --fullchain-file '${cert_dir}/cert.pem' --reloadcmd true >>'${work_dir}/acme.log' 2>&1"
-    (crontab -l 2>/dev/null; echo "17 4 * * * ${sync_cmd} ${sync_marker}") | crontab -
+    _crontab_append_line "17 4 * * * ${sync_cmd} ${sync_marker}" \
+        || yellow "读取现有 crontab 失败，已跳过本次证书同步任务注册（不会清空现有任务，可稍后重试）"
 }
 
 # =========================================================
@@ -2201,7 +2261,7 @@ configure_fixed_tunnel() {
         red "域名格式不合法"; return 0
     fi
 
-    reading "\n请输入 Argo 密钥（Token 或 JSON）: " argo_auth
+    reading_silent "\n请输入 Argo 密钥（Token 或 JSON，输入不回显）: " argo_auth
     [ -z "$argo_auth" ] && { red "密钥不能为空"; return 0; }
 
     local current_argo_port
