@@ -1549,6 +1549,16 @@ _acme_sh_issue_cert() {
     local cert_dir="${work_dir}/acme/${domain}"
     mkdir -p "$cert_dir"
 
+    # 显式为这个自定义 --home 目录设置默认 CA 为 Let's Encrypt。
+    # 原因：--issue 时传的 --server letsencrypt 只在该 --home 下账号首次注册时生效；
+    # 一旦 account.conf 已存在（哪怕是之前某次异常中途生成的坏状态），acme.sh 会优先读取
+    # account.conf 里记录的 CA，命令行 --server 参数不会再覆盖它——2026-08 实测确认
+    # 即便传了 --server letsencrypt，新版 acme.sh 仍可能先走默认的 ZeroSSL 前置流程。
+    # --set-default-ca 不依赖账号是否已注册、可重复执行，幂等，因此每次签发前都跑一次，
+    # 从根源上避免 --home 目录下的 CA 状态被错误地固化成 ZeroSSL。
+    "$_acme_sh_bin" --set-default-ca --server letsencrypt \
+        --home "${work_dir}/.acme.sh" >>"${work_dir}/acme.log" 2>&1
+
     # 已有证书且未接近过期（acme.sh --issue 对已存在且未到期的证书会直接跳过重复申请，
     # 幂等，可放心重复调用）
     if CF_Token="$token" CF_Zone_ID="$zone_id" \
