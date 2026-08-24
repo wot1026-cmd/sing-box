@@ -2154,6 +2154,13 @@ select_extra_protocols() {
     # 故不再需要类似缓存。
     _protocol_cert_cache_file=$(mktemp)
     rm -f "$_protocol_cert_cache_file"  # 只借用一个不会重名的临时路径，文件本身按需生成
+    # 记录本轮批量新增（而非之前就已装好、这轮只是跳过）的协议 tag：
+    # add_protocol_tuic/reality/anytls 各自只负责写 inbound、放行端口、
+    # 标记 protocols.list（可能还有 protocols_acme.list + acme cron），
+    # 并不在函数内部各自重启 sing-box——真正让配置生效的重启统一放在本函数
+    # 最后一次性做。这意味着如果重启失败，需要能把"这一轮新增的"协议整体
+    # 撤回，而不能动本来就已经装好、这轮没碰过的协议。
+    local _added_this_batch=()
     for (( j=0; j<${#compact}; j++ )); do
         c="${compact:$j:1}"
         if ! [[ "$c" =~ ^[0-9]$ ]]; then
@@ -2166,17 +2173,53 @@ select_extra_protocols() {
             continue
         fi
         tag="${EXTRA_PROTO_ORDER[$idx]}"
+        local _already_installed=false
+        is_protocol_installed "$tag" && _already_installed=true
         case "$tag" in
             tuic)    add_protocol_tuic ;;
             reality) add_protocol_reality ;;
             anytls)  add_protocol_anytls ;;
         esac
+        # 只有"这轮之前未安装、这轮成功新装上了"的才需要在失败时回滚；
+        # 已经装过的（is_protocol_installed 提前判 true，函数内部会打印
+        # "已安装，跳过" 并直接 return）不能被记进回滚列表，否则重启失败时
+        # 会把用户本来就在用的协议误删掉。
+        if ! $_already_installed && is_protocol_installed "$tag"; then
+            _added_this_batch+=("$tag")
+        fi
     done
     rm -f "$_protocol_cert_cache_file"
     unset _protocol_cert_cache_file
 
+    if [ ${#_added_this_batch[@]} -eq 0 ]; then
+        # 本轮没有任何协议被成功新增（全部是已安装跳过，或全部因证书/端口
+        # 等原因添加失败），没有新配置需要生效，不必重启，避免无意义重启
+        # 打断正在运行的服务。
+        return 0
+    fi
+
     check_singbox &>/dev/null
-    [ $? -ne 2 ] && restart_singbox
+    if [ $? -eq 2 ]; then
+        # sing-box 主体尚未安装：备用协议的 inbound 已经写进 inbounds.json，
+        # 但主体安装流程本身还没跑完、还没有"重启后应该正常"这个前提，这里
+        # 重启没有意义，交由后续 do_install 统一处理。
+        return 0
+    fi
+    if restart_singbox; then
+        green "\n已应用新增协议配置\n"
+        get_info
+    else
+        red "\n协议已写入配置，但 sing-box 重启失败，正在回滚本轮新增的协议…"
+        local _rb_tag
+        for _rb_tag in "${_added_this_batch[@]}"; do
+            remove_protocol "$_rb_tag"
+        done
+        if restart_singbox; then
+            red "已回滚本轮新增协议，服务已恢复到添加前状态，请排查后重试\n"
+        else
+            red "回滚后服务仍未启动，请检查：journalctl -u sing-box -n 50 --no-pager\n"
+        fi
+    fi
     return 0
 }
 
@@ -2224,7 +2267,7 @@ manage_extra_protocols() {
 
         case "$choice" in
             a|A)
-                select_extra_protocols && get_info
+                select_extra_protocols
                 ;;
             d|D)
                 if ! $any_installed; then
