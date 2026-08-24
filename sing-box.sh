@@ -1387,12 +1387,18 @@ ensure_acme_config() {
     token=$(_read_cf_env_key CF_ACME_TOKEN)
     domain=$(_read_cf_env_key CF_ACME_DOMAIN)
     zone_id=$(_read_cf_env_key CF_ACME_ZONE_ID)
-    # 三个字段必须同时存在才算已配置完整（历史遗留：旧版本脚本只存了
-    # token/domain 两个字段，没有 zone_id，若只判断前两者会误判为"已配置"，
-    # 导致后续 acme.sh 因缺 zone_id 直接申请失败，且不会再询问用户补齐）。
-    if [ -n "$token" ] && [ -n "$domain" ] && [ -n "$zone_id" ]; then
-        return 0
-    fi
+    # 三个字段必须同时存在才算"已保存过完整配置"（历史遗留：旧版本脚本
+    # 只存了 token/domain 两个字段，没有 zone_id，若只判断前两者会误判为
+    # "已配置"，导致后续 acme.sh 因缺 zone_id 直接申请失败）。
+    #
+    # 注意：即使三项齐全，也不再在这里直接 return 0 静默复用 —— 之前的写法
+    # 会导致"只要以前配过一次 acme，以后每次添加协议都被自动认定用 acme，
+    # 完全没有机会选自签"，把"是否使用 acme"和"是否复用已保存凭证"这两件
+    # 独立的事绑在了一起。现在无论是否已保存过配置，都先让用户在 1/2 之间
+    # 选一次；选 acme 之后，如果检测到有已保存的完整凭证，才追加问一次
+    # "是否直接复用"，用户仍可选择重新手动输入。
+    local has_saved_cfg=false
+    [ -n "$token" ] && [ -n "$domain" ] && [ -n "$zone_id" ] && has_saved_cfg=true
 
     # 本函数会在 _resolve_protocol_cert 的命令替换（$(...)）中被同步调用，
     # 该外层调用会把本函数（及其调用链上所有函数）打印到 stdout 的一切内容
@@ -1409,6 +1415,19 @@ ensure_acme_config() {
 
     if [ "$acme_choice" != "1" ]; then
         return 1
+    fi
+
+    if $has_saved_cfg; then
+        echo "" >&2
+        yellow "检测到已保存的 acme 配置（域名：${domain}），是否直接复用？" >&2
+        local reuse_acme
+        reading "是否复用已保存的域名/Token/Zone ID？(Y/n，回车默认 Y): " reuse_acme
+        if ! [[ "$reuse_acme" =~ ^[nN]$ ]]; then
+            return 0
+        fi
+        # 选择不复用：清空局部变量，走下面的重新输入分支，
+        # 输入完成后会用新值覆盖 cf.env 里的旧值。
+        token=""; domain=""; zone_id=""
     fi
 
     reading "请输入用于该协议的子域名（如 node1.yourdomain.com，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
@@ -2086,6 +2105,18 @@ manage_extra_protocols() {
         local has_creds=false
         [ -d "${work_dir}/protocol_creds" ] && [ -n "$(ls -A "${work_dir}/protocol_creds" 2>/dev/null)" ] && has_creds=true
         $has_creds && yellow "c. 清除旧配置存档（清除后重新添加将不再提示复用）"
+        # acme 配置（Cloudflare Token/域名/Zone ID）独立于协议身份存档，
+        # 二者分开清除：c 只清 UUID/密码/端口这类节点身份，不动 acme 凭证，
+        # 避免清一个的时候误把另一个也带走。
+        local has_acme_cfg=false
+        if [ -f "${work_dir}/cf.env" ]; then
+            local _e_tok _e_dom _e_zid
+            _e_tok=$(_read_cf_env_key CF_ACME_TOKEN)
+            _e_dom=$(_read_cf_env_key CF_ACME_DOMAIN)
+            _e_zid=$(_read_cf_env_key CF_ACME_ZONE_ID)
+            [ -n "$_e_tok" ] || [ -n "$_e_dom" ] || [ -n "$_e_zid" ] && has_acme_cfg=true
+        fi
+        $has_acme_cfg && yellow "e. 清除 acme 配置（Cloudflare Token/域名/Zone ID，清除后重新添加将改为询问证书类型）"
         purple "0. 返回主菜单"
         skyblue "------------"
         reading "请输入选择: " choice
@@ -2125,6 +2156,20 @@ manage_extra_protocols() {
                 if [[ "$confirm_clear" =~ ^[yY]$ ]]; then
                     rm -rf "${work_dir}/protocol_creds"
                     green "存档已清除"
+                fi
+                sleep 1
+                ;;
+            e|E)
+                if ! $has_acme_cfg; then
+                    yellow "当前没有可清除的 acme 配置"; sleep 1; continue
+                fi
+                yellow "将清除已保存的 Cloudflare Token / 域名 / Zone ID，仅影响以后新证书申请，不影响已签发证书的现有有效期"
+                reading "确定清除 acme 配置？此操作不可恢复 (y/N): " confirm_clear_acme
+                if [[ "$confirm_clear_acme" =~ ^[yY]$ ]]; then
+                    if [ -f "${work_dir}/cf.env" ]; then
+                        sed -i '/^CF_ACME_TOKEN=/d;/^CF_ACME_DOMAIN=/d;/^CF_ACME_ZONE_ID=/d' "${work_dir}/cf.env"
+                    fi
+                    green "acme 配置已清除，下次添加需 acme 证书的协议时将重新询问"
                 fi
                 sleep 1
                 ;;
