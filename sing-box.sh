@@ -1394,10 +1394,17 @@ ensure_acme_config() {
         return 0
     fi
 
-    echo ""
-    purple "该协议需要 TLS 证书。可选择：\n"
-    skyblue "1. 使用 acme 自动申请真实证书（需域名 + Cloudflare API Token/Zone ID，DNS 记录须为“仅 DNS”不走代理）"
-    skyblue "2. 使用自签证书（客户端需 insecure=1 跳过验证，配置更快）"
+    # 本函数会在 _resolve_protocol_cert 的命令替换（$(...)）中被同步调用，
+    # 该外层调用会把本函数（及其调用链上所有函数）打印到 stdout 的一切内容
+    # 全部当成返回值捕获，混进最终的证书域名字符串，导致生成的节点链接里
+    # sni 字段变成一整段提示文字（曾实际触发：sni 里出现"acme.sh 证书已就绪：
+    # ..."这样的文本）。因此这里所有仅供人看的提示一律显式 >&2，不占用 stdout；
+    # reading 系列不受影响——它们的提示文字通过内部 $(red "$1") 自行捕获，
+    # 与本函数外层的 stdout 无关。
+    echo "" >&2
+    purple "该协议需要 TLS 证书。可选择：\n" >&2
+    skyblue "1. 使用 acme 自动申请真实证书（需域名 + Cloudflare API Token/Zone ID，DNS 记录须为“仅 DNS”不走代理）" >&2
+    skyblue "2. 使用自签证书（客户端需 insecure=1 跳过验证，配置更快）" >&2
     reading "请选择 (1/2，回车默认 2): " acme_choice
 
     if [ "$acme_choice" != "1" ]; then
@@ -1406,33 +1413,33 @@ ensure_acme_config() {
 
     reading "请输入用于该协议的子域名（如 node1.yourdomain.com，需已在 Cloudflare 解析到本机 IP 且为“仅 DNS”）: " domain
     if [ -z "$domain" ]; then
-        yellow "域名为空，回退使用自签证书"
+        yellow "域名为空，回退使用自签证书" >&2
         return 1
     fi
     if ! [[ "$domain" =~ ^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$ ]]; then
-        yellow "域名格式不合法，回退使用自签证书"
+        yellow "域名格式不合法，回退使用自签证书" >&2
         return 1
     fi
     reading_silent "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名，输入不回显）: " token
     if [ -z "$token" ]; then
-        yellow "Token 为空，回退使用自签证书"
+        yellow "Token 为空，回退使用自签证书" >&2
         return 1
     fi
-    echo ""
-    yellow "acme.sh 需要 Zone ID 才能定位到具体域名（Cloudflare 后台该域名的 Overview 页面右侧“API”栏可查看）"
+    echo "" >&2
+    yellow "acme.sh 需要 Zone ID 才能定位到具体域名（Cloudflare 后台该域名的 Overview 页面右侧“API”栏可查看）" >&2
     reading "请输入 Cloudflare Zone ID: " zone_id
     if [ -z "$zone_id" ]; then
-        yellow "Zone ID 为空，回退使用自签证书"
+        yellow "Zone ID 为空，回退使用自签证书" >&2
         return 1
     fi
 
     if ! _write_cf_env_key CF_ACME_TOKEN "$token" || \
        ! _write_cf_env_key CF_ACME_DOMAIN "$domain" || \
        ! _write_cf_env_key CF_ACME_ZONE_ID "$zone_id"; then
-        red "acme 配置写入失败，回退使用自签证书"
+        red "acme 配置写入失败，回退使用自签证书" >&2
         return 1
     fi
-    green "acme 配置已保存（${work_dir}/cf.env，权限 600）"
+    green "acme 配置已保存（${work_dir}/cf.env，权限 600）" >&2
     return 0
 }
 
@@ -1455,28 +1462,28 @@ _ensure_acme_sh_installed() {
     if [ -x "$_acme_sh_bin" ]; then
         return 0
     fi
-    yellow "首次使用 acme.sh，正在安装…"
+    yellow "首次使用 acme.sh，正在安装…" >&2
     # 不传 email 参数：acme.sh 官方文档确认该参数默认即为空，不是必需项。
     # 曾尝试用 hostname -f 拼邮箱，但多数云 VPS 的 hostname -f 只返回短主机名（如 "74"），
     # 拼出的 "acme@74" 不是合法邮箱格式，可能导致 CA 账号注册被拒——不传更安全。
     local _acme_installer
     _acme_installer=$(mktemp)
     if ! curl -fsSL https://get.acme.sh -o "$_acme_installer" 2>/dev/null; then
-        red "acme.sh 安装脚本下载失败，请检查网络"
+        red "acme.sh 安装脚本下载失败，请检查网络" >&2
         rm -f "$_acme_installer"
         return 1
     fi
     if ! sh "$_acme_installer" --nocron >/dev/null 2>&1; then
-        red "acme.sh 安装失败"
+        red "acme.sh 安装失败" >&2
         rm -f "$_acme_installer"
         return 1
     fi
     rm -f "$_acme_installer"
     if [ ! -x "$_acme_sh_bin" ]; then
-        red "acme.sh 安装后未找到可执行文件：${_acme_sh_bin}"
+        red "acme.sh 安装后未找到可执行文件：${_acme_sh_bin}" >&2
         return 1
     fi
-    green "acme.sh 安装完成"
+    green "acme.sh 安装完成" >&2
     return 0
 }
 
@@ -1489,7 +1496,7 @@ _acme_sh_issue_cert() {
     token=$(_read_cf_env_key CF_ACME_TOKEN)
     zone_id=$(_read_cf_env_key CF_ACME_ZONE_ID)
     if [ -z "$token" ] || [ -z "$zone_id" ]; then
-        red "未找到 acme Cloudflare Token/Zone ID 配置"
+        red "未找到 acme Cloudflare Token/Zone ID 配置" >&2
         return 1
     fi
 
@@ -1508,7 +1515,7 @@ _acme_sh_issue_cert() {
         local ret=$?
         # acme.sh 对"证书未到期无需续期"返回码为 2，不是失败
         if [ "$ret" -ne 2 ]; then
-            red "acme.sh 证书申请失败，详情见 ${work_dir}/acme.log"
+            red "acme.sh 证书申请失败，详情见 ${work_dir}/acme.log" >&2
             return 1
         fi
     fi
@@ -1519,16 +1526,16 @@ _acme_sh_issue_cert() {
         --key-file "${cert_dir}/key.pem" \
         --fullchain-file "${cert_dir}/cert.pem" \
         --reloadcmd "true" >>"${work_dir}/acme.log" 2>&1; then
-        red "acme.sh 证书安装失败，详情见 ${work_dir}/acme.log"
+        red "acme.sh 证书安装失败，详情见 ${work_dir}/acme.log" >&2
         return 1
     fi
 
     if [ ! -s "${cert_dir}/cert.pem" ] || [ ! -s "${cert_dir}/key.pem" ]; then
-        red "证书文件未正确生成：${cert_dir}"
+        red "证书文件未正确生成：${cert_dir}" >&2
         return 1
     fi
 
-    green "acme.sh 证书已就绪：${cert_dir}（自动续期由 acme.sh 自带 cron 处理）"
+    green "acme.sh 证书已就绪：${cert_dir}（自动续期由 acme.sh 自带 cron 处理）" >&2
 
     _ensure_acme_sync_cron "$domain"
     return 0
