@@ -2552,11 +2552,24 @@ _do_uninstall_core() {
         [ -f "$IPV6_AUTOFIX_LOG" ] && cp "$IPV6_AUTOFIX_LOG" "${backup_dir}/ipv6-autofix.log"
         chmod -R go-rwx "$backup_dir" 2>/dev/null
 
-        if [ -s "${backup_dir}/inbounds.json" ] && [ -s "${backup_dir}/cert.pem" ]; then
-            green "节点配置与证书已备份至 ${backup_dir}，重装时将自动检测并询问是否恢复"
+        if [ -s "${backup_dir}/inbounds.json" ]; then
+            # 之前这里要求 inbounds.json 和 cert.pem 同时存在才算备份成功，缺 cert.pem
+            # 就整个 backup_dir 一起 rm -rf 删掉。但 cert.pem 只在"用过自签证书"时才会
+            # 生成 —— 协议全部改用 acme 真实证书后，系统里根本不存在这个文件，属于
+            # 正常场景却被当成"备份失败"，导致已经拷贝好的 argo_token、tunnel.yml、
+            # cf.env 等全部被一起清空（实际复现过：三个备用协议都用 acme 证书后卸载，
+            # backup_dir 因缺 cert.pem 被判定失败、整个目录被删，重装后 Argo 隧道因缺
+            # token 无法启动）。inbounds.json 才是节点配置是否备份下来的关键标志，
+            # cert.pem 缺失只是提示一下、不影响备份整体成败。
+            if [ -s "${backup_dir}/cert.pem" ]; then
+                green "节点配置与证书已备份至 ${backup_dir}，重装时将自动检测并询问是否恢复"
+            else
+                yellow "提示：未检测到自签证书（cert.pem），如协议均使用 acme 证书属正常现象"
+                green "节点配置已备份至 ${backup_dir}，重装时将自动检测并询问是否恢复"
+            fi
             BACKUP_SUCCESS=true
         else
-            red "备份失败（inbounds.json 或 cert.pem 缺失），将按未保留配置继续卸载"
+            red "备份失败（inbounds.json 缺失），将按未保留配置继续卸载"
             rm -rf "$backup_dir" 2>/dev/null
         fi
     else
