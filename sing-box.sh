@@ -36,6 +36,15 @@ export CFPORT=${CFPORT:-'443'}
 
 # ── 前置检查 ──────────────────────────────────────
 [[ $EUID -ne 0 ]] && red "请在 root 用户下运行脚本" && exit 1
+# 已确认是 root，顺带把 HOME 锚定为 /root：部分调用方式（sudo -E 保留调用者
+# 环境、部分 systemd/cron 执行上下文）下 $HOME 不保证等于 /root 甚至未设置。
+# 这不仅关系到本脚本自己读取路径用的 _acme_sh_bin（已写死 /root/... 不受
+# 影响），更关键的是 get.acme.sh 装的第三方安装脚本自己会读取运行时 $HOME
+# 来决定安装位置（默认装到 $HOME/.acme.sh）——如果不在这里统一锚定，安装器
+# 和 _acme_sh_bin 会指向两个不同目录，导致"装是装了，但脚本读取路径下找不到
+# 可执行文件"这类不一致报错。放在这里而非仅在 acme.sh 安装函数内设置，是为了
+# 让 HOME 在整个脚本执行期间都保持确定，不遗漏其他可能隐式依赖 $HOME 的地方。
+export HOME=/root
 command -v systemctl >/dev/null 2>&1 || { red "本脚本仅支持 systemd 系统（Ubuntu/Debian）"; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -1435,7 +1444,12 @@ ensure_acme_config() {
 # sing-box 官方文档确认证书文件在被修改时会自动重新加载，
 # 续期由 acme.sh 自带的 cron 任务处理，全程无需重启 sing-box。
 # =========================================================
-_acme_sh_bin="${HOME}/.acme.sh/acme.sh"
+# 不写 "${HOME}/.acme.sh/acme.sh"：脚本已在开头强制 root 运行且顺带把
+# HOME 锚定为 /root（见顶部 EUID 检查附近），但这里仍不直接引用 $HOME、
+# 而是写死路径——双重保险：即便以后 HOME 锚定那行被移动或误删，本变量
+# 依然不受影响，不会静默拼出 "/.acme.sh/acme.sh" 这种错误路径。
+# 既然前提已确保是 root，直接写死更可靠。
+_acme_sh_bin="/root/.acme.sh/acme.sh"
 
 _ensure_acme_sh_installed() {
     if [ -x "$_acme_sh_bin" ]; then
@@ -1452,7 +1466,7 @@ _ensure_acme_sh_installed() {
         rm -f "$_acme_installer"
         return 1
     fi
-    if ! sh "$_acme_installer" >/dev/null 2>&1; then
+    if ! sh "$_acme_installer" --nocron >/dev/null 2>&1; then
         red "acme.sh 安装失败"
         rm -f "$_acme_installer"
         return 1
@@ -1522,11 +1536,14 @@ _acme_sh_issue_cert() {
 
 # 独立于 acme.sh 自带的 reloadcmd 机制，额外加两道保险：
 #
-# 1) 真正的续期检查：acme.sh 安装脚本会自动生成一条系统级 --cron 任务，
+# 1) 真正的续期检查：acme.sh 安装脚本默认会自动生成一条系统级 --cron 任务，
 #    但它固定使用默认的 --home（如 /root/.acme.sh），与本脚本证书数据实际存放的
 #    自定义 --home（${work_dir}/.acme.sh）是两个不同目录，无法读到我们的账号/证书数据，
 #    实际上不会对这里申请的证书做任何续期检查（2026-08 DediRock 实测确认此现象）。
-#    此处额外注册一条指向正确 --home 的 --cron 任务，确保续期检查真正生效。
+#    因此安装时已加 --nocron 从源头消除这条无用任务（见 _ensure_acme_sh_installed），
+#    但自定义 --home 这个根本问题依然存在，所以这里仍需额外注册一条指向正确
+#    --home 的 --cron 任务，确保续期检查真正生效——--nocron 只是去掉了原本
+#    形同虚设的那一条，不代表这条自建任务可以省略。
 #
 # 2) 证书同步：部分环境下 acme.sh 续期时不会按预期重新执行 install-cert（社区有相关反馈，
 #    行为不完全可靠），若证书续期了但未同步到 certificate_path 指向的文件，
@@ -2104,12 +2121,18 @@ append_extra_protocol_links() {
         port=$(jq -r '.inbounds[] | select(.tag=="tuic") | .listen_port' "${conf_dir}/inbounds.json")
         uuid=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].uuid' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="tuic") | .users[0].password' "${conf_dir}/inbounds.json")
-        if _protocol_uses_acme tuic; then
+        if ! _creds_field_valid "$uuid" || ! _creds_field_valid "$pass" || ! _creds_field_valid "$port" port; then
+            yellow "TUIC 配置字段异常（inbounds.json 可能已损坏），跳过生成该节点链接"
+        elif _protocol_uses_acme tuic; then
             sni=$(jq -r '.inbounds[] | select(.tag=="tuic") | .tls.server_name' "${conf_dir}/inbounds.json")
-            # acme 真实证书，标准 TLS 验证。显式写 insecure=0（而非省略该字段），
-            # 避免依赖客户端在字段缺省时的隐含默认行为（勇哥/fscarmen 脚本同样显式写 0，已验证更可靠）。
-            ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-ip"
-            domain_links+=$'\n'"tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-domain"
+            if ! _creds_field_valid "$sni"; then
+                yellow "TUIC 证书域名字段异常（inbounds.json 可能已损坏），跳过生成该节点链接"
+            else
+                # acme 真实证书，标准 TLS 验证。显式写 insecure=0（而非省略该字段），
+                # 避免依赖客户端在字段缺省时的隐含默认行为（勇哥/fscarmen 脚本同样显式写 0，已验证更可靠）。
+                ip_links+=$'\n'"tuic://${uuid}:${pass}@${server_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-ip"
+                domain_links+=$'\n'"tuic://${uuid}:${pass}@${sni}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&insecure=0&allowInsecure=0&allow_insecure=0#${node_prefix} tuic-domain"
+            fi
         else
             # 实测：pinSHA256 在 Egern / v2rayN 的 TUIC 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，三个字段名同写以兼容不同客户端。
@@ -2126,21 +2149,32 @@ append_extra_protocol_links() {
         sni=$(jq -r '.inbounds[] | select(.tag=="reality") | .tls.server_name' "${conf_dir}/inbounds.json")
         pub=$(_reality_public_key)
         sid=$(_reality_short_id)
-        # Reality 走伪装握手，本身不依赖真实域名解析，始终只用 IP 直连
-        ip_links+=$'\n'"vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${node_prefix} reality"
+        if ! _creds_field_valid "$uuid" || ! _creds_field_valid "$port" port \
+           || ! _creds_field_valid "$sni" || ! _creds_field_valid "$pub" || ! _creds_field_valid "$sid"; then
+            yellow "Reality 配置字段异常（inbounds.json 可能已损坏），跳过生成该节点链接"
+        else
+            # Reality 走伪装握手，本身不依赖真实域名解析，始终只用 IP 直连
+            ip_links+=$'\n'"vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${node_prefix} reality"
+        fi
     fi
 
     if is_protocol_installed anytls; then
         local port pass sni
         port=$(jq -r '.inbounds[] | select(.tag=="anytls") | .listen_port' "${conf_dir}/inbounds.json")
         pass=$(jq -r '.inbounds[] | select(.tag=="anytls") | .users[0].password' "${conf_dir}/inbounds.json")
-        if _protocol_uses_acme anytls; then
+        if ! _creds_field_valid "$pass" || ! _creds_field_valid "$port" port; then
+            yellow "AnyTLS 配置字段异常（inbounds.json 可能已损坏），跳过生成该节点链接"
+        elif _protocol_uses_acme anytls; then
             sni=$(jq -r '.inbounds[] | select(.tag=="anytls") | .tls.server_name' "${conf_dir}/inbounds.json")
-            # acme 真实证书，标准 TLS 验证。显式写 insecure=0，避免依赖客户端缺省行为
-            # （实测 Egern 在 anytls:// 链接缺省 insecure 字段时，界面会显示"跳过验证=开"，
-            # 显式写 0 后应能纠正该显示状态，参考勇哥脚本同款写法）。
-            ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-ip"
-            domain_links+=$'\n'"anytls://${pass}@${sni}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-domain"
+            if ! _creds_field_valid "$sni"; then
+                yellow "AnyTLS 证书域名字段异常（inbounds.json 可能已损坏），跳过生成该节点链接"
+            else
+                # acme 真实证书，标准 TLS 验证。显式写 insecure=0，避免依赖客户端缺省行为
+                # （实测 Egern 在 anytls:// 链接缺省 insecure 字段时，界面会显示"跳过验证=开"，
+                # 显式写 0 后应能纠正该显示状态，参考勇哥脚本同款写法）。
+                ip_links+=$'\n'"anytls://${pass}@${server_ip}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-ip"
+                domain_links+=$'\n'"anytls://${pass}@${sni}:${port}?sni=${sni}&insecure=0&allowInsecure=0#${node_prefix} anytls-domain"
+            fi
         else
             # 实测：pinSHA256/hpkp/pcs 等指纹字段在 Egern / v2rayN 的 AnyTLS 解析器里均不生效（2026-08 验证）。
             # 自签证书场景下必须显式 insecure=1，两个字段名同写以兼容不同客户端。
@@ -3630,6 +3664,14 @@ do_install() {
     ARGO_TOKEN_RESTORED=false
 
     install_packages jq openssl curl || { red "基础依赖安装失败，请检查网络或软件源"; return 1; }
+    # iproute2 单独处理：install_packages 假定"参数名==命令名"（对 jq/openssl/curl
+    # 成立），但 iproute2 这个包提供的命令是 ss，两者不一致，直接混进上面那行会导致
+    # command_exists 永远查不到、每次都误判为未安装。ss 被 _port_in_use、SSH 端口
+    # 探测等多处依赖，标准 Ubuntu/Debian 镜像通常已预装，这里只在缺失时才装。
+    if ! command_exists ss; then
+        yellow "未检测到 ss（iproute2），正在安装…"
+        apt-get install -y iproute2 || { red "iproute2 安装失败，请检查网络或软件源"; return 1; }
+    fi
 
     yellow "正在查询 sing-box 最新版本…"
     local install_ver
