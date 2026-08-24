@@ -1993,7 +1993,7 @@ remove_protocol() {
 # =========================================================
 select_extra_protocols() {
     clear; echo ""
-    purple "=== 选择要添加的备用协议（可多选，直接连写数字，如 13 表示装 TUIC 和 AnyTLS，回车跳过）===\n"
+    purple "=== 选择要添加的备用协议 ===\n"
     local i=1 tag
     for tag in "${EXTRA_PROTO_ORDER[@]}"; do
         if is_protocol_installed "$tag"; then
@@ -2004,9 +2004,9 @@ select_extra_protocols() {
         (( i++ ))
     done
     echo ""
-    reading "请输入序号: " choices
+    reading "请输入序号（直接连写数字，如 13，回车取消）: " choices
 
-    [ -z "$choices" ] && { purple "已跳过\n"; return 0; }
+    [ -z "$choices" ] && { purple "已跳过\n"; return 1; }
 
     # 协议数量固定为个位数，序号直接连写即可（如 "13"），仍兼容空格分隔（如 "1 3"）
     local compact="${choices// /}"
@@ -2032,6 +2032,7 @@ select_extra_protocols() {
 
     check_singbox &>/dev/null
     [ $? -ne 2 ] && restart_singbox
+    return 0
 }
 
 # =========================================================
@@ -2066,8 +2067,7 @@ manage_extra_protocols() {
 
         case "$choice" in
             a|A)
-                select_extra_protocols
-                get_info
+                select_extra_protocols && get_info
                 ;;
             d|D)
                 if ! $any_installed; then
