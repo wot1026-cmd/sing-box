@@ -16,10 +16,6 @@ yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue(){ echo -e "\e[1;36m$1\033[0m"; }
 reading(){ read -p "$(red "$1")" "$2" || exit 1; }
-# 用法同 reading，但输入不回显（Token/密钥等敏感信息用这个，避免明文留在
-# 终端 scrollback / 录屏 / 共享终端场景中）。read -s 结束后终端不会自动换行，
-# 这里补一个换行，避免下一行输出紧贴在光标后面。
-reading_silent(){ read -s -p "$(red "$1")" "$2" || exit 1; echo; }
 
 # ── 常量 ──────────────────────────────────────────
 work_dir="/etc/sing-box"
@@ -1439,7 +1435,7 @@ ensure_acme_config() {
         yellow "域名格式不合法，回退使用自签证书" >&2
         return 1
     fi
-    reading_silent "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名，输入不回显）: " token
+    reading "请输入 Cloudflare API Token（Zone:DNS:Edit 权限，仅作用于该域名）: " token
     if [ -z "$token" ]; then
         yellow "Token 为空，回退使用自签证书" >&2
         return 1
@@ -2382,7 +2378,7 @@ configure_fixed_tunnel() {
         red "域名格式不合法"; return 0
     fi
 
-    reading_silent "\n请输入 Argo 密钥（Token 或 JSON，输入不回显）: " argo_auth
+    reading "\n请输入 Argo 密钥（Token 或 JSON）: " argo_auth
     [ -z "$argo_auth" ] && { red "密钥不能为空"; return 0; }
 
     local current_argo_port
