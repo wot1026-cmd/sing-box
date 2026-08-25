@@ -1345,12 +1345,6 @@ _mark_protocol_removed() {
 }
 
 # ── inbounds.json 读写工具（复用主脚本 jq 风格） ──
-_inbound_exists() {
-    local tag="$1"
-    jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' \
-        "${conf_dir}/inbounds.json" >/dev/null 2>&1
-}
-
 _add_inbound_json() {
     # $1 = 新 inbound 的 JSON 字符串
     local new_inbound="$1"
