@@ -25,7 +25,7 @@ backup_dir="/etc/sing-box-backup"
 SCRIPT_URL="https://raw.githubusercontent.com/wot1026/sing-box/main/sing-box.sh"
 ARGO_PORT="8001"
 
-SB_VERSION="1.13.18"
+SB_VERSION="1.13.19"
 
 export CFIP=${CFIP:-'cf.877774.xyz'}
 export CFPORT=${CFPORT:-'443'}
@@ -2625,8 +2625,6 @@ configure_fixed_tunnel() {
         rm -f "${work_dir}/argo_token"
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         chmod 600 "${work_dir}/tunnel.json"
-
-        [ -z "$tunnel_id" ] && { red "无法解析 TunnelID，请检查 JSON 格式"; return 0; }
 
         cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: ${tunnel_id}
