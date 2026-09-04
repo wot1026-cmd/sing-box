@@ -1,5 +1,5 @@
 # 自动同步自 kelee.one
-# 更新时间: 2026-09-03 03:00:03
+# 更新时间: 2026-09-04 03:00:03
 # 插件: Block_HTTPDNS
 # 模式: exception
 
@@ -513,6 +513,22 @@ rules:
 - domain:
     match: hd.xiaojukeji.com
     policy: REJECT
+- ip_cidr:
+    match: 116.85.2.41/32
+    policy: REJECT
+    no_resolve: true
+- ip_cidr:
+    match: 116.85.3.39/32
+    policy: REJECT
+    no_resolve: true
+- ip_cidr:
+    match: 123.207.209.142/32
+    policy: REJECT
+    no_resolve: true
+- ip_cidr:
+    match: 139.199.240.84/32
+    policy: REJECT
+    no_resolve: true
 - domain:
     match: httpdns.zybang.com
     policy: REJECT
